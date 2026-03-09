@@ -1,0 +1,68 @@
+0 verbose cli C:\Program Files\nodejs\node.exe C:\Users\yasir\AppData\Roaming\npm\node_modules\npm\bin\npm-cli.js
+1 info using npm@11.1.0
+2 info using node@v22.14.0
+3 silly config load:file:C:\Users\yasir\AppData\Roaming\npm\node_modules\npm\npmrc
+4 silly config load:file:C:\PROJECTS\react\ecommerce\backend\.npmrc
+5 silly config load:file:C:\Users\yasir\.npmrc
+6 silly config load:file:C:\Users\yasir\AppData\Roaming\npm\etc\npmrc
+7 verbose title npm install cloudinary@2.5.1 dotenv@16.4.5
+8 verbose argv "install" "cloudinary@2.5.1" "dotenv@16.4.5" "--no-fund" "--no-audit"
+9 verbose logfile logs-max:10 dir:C:\PROJECTS\react\ecommerce\backend\.npm-cache\_logs\2026-03-09T16_18_57_448Z-
+10 verbose logfile C:\PROJECTS\react\ecommerce\backend\.npm-cache\_logs\2026-03-09T16_18_57_448Z-debug-0.log
+11 silly logfile done cleaning log files
+12 silly packumentCache heap:2197815296 maxSize:549453824 maxEntrySize:274726912
+13 silly idealTree buildDeps
+14 silly fetch manifest cloudinary@2.5.1
+15 silly packumentCache full:https://registry.npmjs.org/cloudinary cache-miss
+16 http fetch GET https://registry.npmjs.org/cloudinary attempt 1 failed with EACCES
+17 http fetch GET https://registry.npmjs.org/npm attempt 1 failed with EACCES
+18 http fetch GET https://registry.npmjs.org/cloudinary attempt 2 failed with EACCES
+19 http fetch GET https://registry.npmjs.org/npm attempt 2 failed with EACCES
+20 http fetch GET https://registry.npmjs.org/cloudinary attempt 3 failed with EACCES
+21 silly fetch manifest dotenv@16.4.5
+22 silly packumentCache full:https://registry.npmjs.org/dotenv cache-miss
+23 http fetch GET https://registry.npmjs.org/npm attempt 3 failed with EACCES
+24 http fetch GET https://registry.npmjs.org/dotenv attempt 1 failed with EACCES
+25 http fetch GET https://registry.npmjs.org/dotenv attempt 2 failed with EACCES
+26 http fetch GET https://registry.npmjs.org/dotenv attempt 3 failed with EACCES
+27 silly placeDep ROOT cloudinary@ OK for: backend@1.0.0 want: 2.5.1
+28 silly placeDep ROOT dotenv@ OK for: backend@1.0.0 want: 16.4.5
+29 verbose type system
+30 verbose stack FetchError: request to https://registry.npmjs.org/cloudinary failed, reason: 
+30 verbose stack     at ClientRequest.<anonymous> (C:\Users\yasir\AppData\Roaming\npm\node_modules\npm\node_modules\minipass-fetch\lib\index.js:130:14)
+30 verbose stack     at ClientRequest.emit (node:events:518:28)
+30 verbose stack     at emitErrorEvent (node:_http_client:104:11)
+30 verbose stack     at _destroy (node:_http_client:898:9)
+30 verbose stack     at onSocketNT (node:_http_client:918:5)
+30 verbose stack     at process.processTicksAndRejections (node:internal/process/task_queues:91:21)
+31 error code EACCES
+32 error errno EACCES
+33 error FetchError: request to https://registry.npmjs.org/cloudinary failed, reason: 
+33 error     at ClientRequest.<anonymous> (C:\Users\yasir\AppData\Roaming\npm\node_modules\npm\node_modules\minipass-fetch\lib\index.js:130:14)
+33 error     at ClientRequest.emit (node:events:518:28)
+33 error     at emitErrorEvent (node:_http_client:104:11)
+33 error     at _destroy (node:_http_client:898:9)
+33 error     at onSocketNT (node:_http_client:918:5)
+33 error     at process.processTicksAndRejections (node:internal/process/task_queues:91:21) {
+33 error   code: 'EACCES',
+33 error   errno: 'EACCES',
+33 error   type: 'system',
+33 error   requiredBy: '.'
+33 error }
+34 error
+34 error The operation was rejected by your operating system.
+34 error It's possible that the file was already in use (by a text editor or antivirus),
+34 error or that you lack permissions to access it.
+34 error
+34 error If you believe this might be a permissions issue, please double-check the
+34 error permissions of the file and its containing directories, or try running
+34 error the command again as root/Administrator.
+35 silly unfinished npm timer reify 1773073137923
+36 silly unfinished npm timer reify:loadTrees 1773073137924
+37 verbose cwd C:\PROJECTS\react\ecommerce\backend
+38 verbose os Windows_NT 10.0.26200
+39 verbose node v22.14.0
+40 verbose npm  v11.1.0
+41 verbose exit 1
+42 verbose code 1
+43 error A complete log of this run can be found in: C:\PROJECTS\react\ecommerce\backend\.npm-cache\_logs\2026-03-09T16_18_57_448Z-debug-0.log

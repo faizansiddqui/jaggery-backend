@@ -1,0 +1,21 @@
+{
+    "name": "backend",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "start": "node app.js",
+        "dev": "nodemon app.js"
+    },
+    "dependencies": {
+        "express": "^4.21.2",
+        "mongoose": "^9.2.4",
+        "multer": "^2.0.2",
+        "node-fetch": "^3.3.2",
+        "sequelize": "^6.37.7",
+        "uuid": "^13.0.0"
+    },
+    "devDependencies": {
+        "nodemon": "^3.1.10"
+    }
+}
