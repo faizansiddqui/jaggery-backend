@@ -4,7 +4,8 @@ import { loadEnv } from "./env.js";
 loadEnv();
 
 const uri = process.env.MONGO_URI;
-const dbName = process.env.MONGO_DB_NAME || "ecommerce";
+/** Default must match this app’s Atlas database (see Data Explorer → Jaggery). */
+const dbName = process.env.MONGO_DB_NAME || "Jaggery";
 
 export const connectDB = async () => {
   if (!uri) {
@@ -16,7 +17,7 @@ export const connectDB = async () => {
       maxPoolSize: 10,
       serverSelectionTimeoutMS: 10000,
     });
-    console.log("✅ MongoDB connected");
+    console.log(`✅ MongoDB connected (database: ${dbName})`);
   } catch (err) {
     console.error("❌ MongoDB connection error:", err.message);
     throw err;
