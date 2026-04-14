@@ -26,6 +26,9 @@ import {
   createOrder,
   confirmPayment,
   cancelOrder,
+  returnOrder,
+  subscribeNewsletter,
+  submitContactForm,
 } from "../controller/user.controller.js";
 import { upload } from "../middleware/multer.middleware.js";
 
@@ -57,6 +60,9 @@ router.post("/get-orders", getUserOrders);
 router.post("/create-order", createOrder);
 router.post("/payment-success", confirmPayment);
 router.post("/cancel-order", cancelOrder);
+router.post("/return-order", returnOrder);
+router.post("/newsletter/subscribe", subscribeNewsletter);
+router.post("/contact/submit", submitContactForm);
 
 export { router };
 export default router;

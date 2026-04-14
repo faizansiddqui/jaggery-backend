@@ -3,7 +3,8 @@ import OrderItemSchema from "./orderItem.model.js";
 
 const OrdersSchema = new mongoose.Schema(
   {
-    order_id: { type: Number, unique: true, index: true },
+    order_id: { type: String, unique: true, index: true, trim: true },
+    order_code: { type: String, unique: true, sparse: true, index: true, trim: true },
     status: { type: String, default: "pending" },
     payment_status: { type: String, default: "pending" },
     payment_method: { type: String, default: "Payoneer" },
@@ -25,6 +26,20 @@ const OrdersSchema = new mongoose.Schema(
     country: { type: String },
     pinCode: { type: String },
     addressType: { type: String },
+    status_history: {
+      type: [
+        new mongoose.Schema(
+          {
+            status: { type: String, required: true, trim: true },
+            updatedAt: { type: Date, default: Date.now },
+            updatedBy: { type: String, default: "system", trim: true },
+            note: { type: String, default: "", trim: true },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
   },
   { timestamps: true }
 );

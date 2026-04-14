@@ -1,6 +1,14 @@
 import mongoose from "mongoose";
 
-const SpecificationSchema = new mongoose.Schema(
+const IngredientSchema = new mongoose.Schema(
+  {
+    key: { type: String, required: true },
+    value: { type: String, required: true },
+  },
+  { _id: false }
+);
+
+const NutritionSchema = new mongoose.Schema(
   {
     key: { type: String, required: true },
     value: { type: String, required: true },
@@ -42,7 +50,8 @@ const ProductSchema = new mongoose.Schema(
       ref: "Catagories",
       required: true,
     },
-    specifications: { type: [SpecificationSchema], default: [] },
+    ingredients: { type: [IngredientSchema], default: [] },
+    nutritions: { type: [NutritionSchema], default: [] },
     variants: { type: [VariantSchema], default: [] },
     status: {
       type: String,

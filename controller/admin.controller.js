@@ -11,10 +11,10 @@ import UserActivity from "../model/activity.model.js";
 import SiteSettings from "../model/siteSettings.model.js";
 import { getNextSequence } from "../model/counter.model.js";
 import Banner from "../model/banner.model.js";
-import {
-  fetchShiprocketTrackingSnapshot,
-  getShiprocketLabelUrl,
-} from "../config/shiprocket.js";
+import Testimonial from "../model/testimonial.model.js";
+import NewsletterSubscriber from "../model/newsletterSubscriber.model.js";
+import ContactSubmission from "../model/contactSubmission.model.js";
+import { sendBrevoEmail } from "../utils/brevo.js";
 import {
   uploadToCloudinary,
   deleteFromCloudinary,
@@ -48,19 +48,27 @@ const createRandomAlphaNum = (length = 12) => {
   return out;
 };
 
+// Helper to call notification utilities that may be sync or return a Promise.
+// Accepts a function that invokes the notification and a label for logging.
+const safeFireAndForget = (fn, label) => {
+  try {
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      result.catch((err) => console.error(`${label} error:`, err?.message || err));
+    }
+  } catch (err) {
+    console.error(`${label} error:`, err?.message || err);
+  }
+};
+
 const normalizeVariantField = (value) => String(value || "").trim().toLowerCase();
 
 const buildVariantStockMap = (product) => {
   const map = new Map();
-  const variants = Array.isArray(product?.colorVariants) ? product.colorVariants : [];
+  const variants = Array.isArray(product?.variants) ? product.variants : [];
   variants.forEach((variant) => {
-    const colorKey = normalizeVariantField(variant?.color);
-    const sizes = Array.isArray(variant?.sizes) ? variant.sizes : [];
-    sizes.forEach((sizeRow) => {
-      const sizeKey = normalizeVariantField(sizeRow?.label);
-      const key = `${colorKey}|${sizeKey}`;
-      map.set(key, Math.max(0, Number(sizeRow?.stock || 0)));
-    });
+    const labelKey = normalizeVariantField(variant?.label);
+    map.set(labelKey, Math.max(0, Number(variant?.stock || 0)));
   });
   return map;
 };
@@ -110,6 +118,7 @@ const buildDefaultSiteSettings = () => ({
     "Forging the future of urban streetwear. Precision engineered, culturally driven, and globally distributed.",
   companyAddress: getEnvString("NEXT_PUBLIC_COMPANY_ADDRESS"),
   companyEmail: getEnvString("NEXT_PUBLIC_COMPANY_EMAIL"),
+  companyPhone: getEnvString("NEXT_PUBLIC_COMPANY_PHONE"),
   emailFooterDescription:
     getEnvString("EMAIL_FOOTER_DESCRIPTION", "NEXT_PUBLIC_EMAIL_FOOTER_DESCRIPTION") ||
     "This is an automated message from StreetRiot commerce engine.",
@@ -122,6 +131,7 @@ const buildDefaultSiteSettings = () => ({
   ),
   instagramGallery: buildDefaultInstagramGallery(),
   twitterUrl: getEnvString("NEXT_PUBLIC_TWITTER_URL"),
+  youtubeUrl: getEnvString("NEXT_PUBLIC_YOUTUBE_URL"),
   facebookUrl: getEnvString("NEXT_PUBLIC_FACEBOOK_URL"),
 });
 
@@ -141,6 +151,7 @@ const createHttpError = (statusCode, message) => {
 const SOCIAL_HOST_WHITELIST = {
   instagram: ["instagram.com", "instagr.am"],
   twitter: ["twitter.com", "x.com"],
+  youtube: ["youtube.com", "youtu.be"],
   facebook: ["facebook.com", "fb.com"],
 };
 
@@ -205,6 +216,7 @@ const shapeSiteSettings = (doc) => {
     footerDescription: String(doc?.footerDescription ?? defaults.footerDescription),
     companyAddress: String(doc?.companyAddress ?? defaults.companyAddress ?? ""),
     companyEmail: String(doc?.companyEmail ?? defaults.companyEmail ?? ""),
+    companyPhone: String(doc?.companyPhone ?? defaults.companyPhone ?? ""),
     emailFooterDescription: String(
       doc?.emailFooterDescription ?? defaults.emailFooterDescription
     ),
@@ -215,6 +227,7 @@ const shapeSiteSettings = (doc) => {
     instagramHandle: normalizeInstagramHandle(doc?.instagramHandle ?? defaults.instagramHandle),
     instagramGallery,
     twitterUrl: String(doc?.twitterUrl ?? defaults.twitterUrl ?? ""),
+    youtubeUrl: String(doc?.youtubeUrl ?? defaults.youtubeUrl ?? ""),
     facebookUrl: String(doc?.facebookUrl ?? defaults.facebookUrl ?? ""),
     updatedBy: String(doc?.updatedBy ?? "admin"),
     updatedAt: doc?.updatedAt || null,
@@ -403,70 +416,56 @@ const parseHighlights = (value) => {
         .filter((h) => h.key && h.value);
     }
   } catch (_) {
-    /* fall through */
+    /* fall back */
   }
   return [];
 };
 
-const parseColorVariants = (value) => {
+const parseWeightVariants = (value) => {
   if (!value) return [];
   let arr = [];
   if (typeof value === "string") {
     try {
       arr = JSON.parse(value);
     } catch {
-      arr = [];
+      return [];
     }
   } else if (Array.isArray(value)) {
     arr = value;
+  } else {
+    return [];
   }
-  if (!Array.isArray(arr)) return [];
-
   return arr
     .map((v) => ({
-      color: (v.color || "").trim(),
-      images: Array.isArray(v.images) ? v.images.filter(Boolean) : [],
-      video: v.video || "",
-      imageCount: Number(v.imageCount || v.images?.length || 0),
-      hasVideo: v.hasVideo ?? !!v.video,
-      price: v.price != null ? Number(v.price) : undefined,
-      discountedPrice: v.discountedPrice != null ? Number(v.discountedPrice) : undefined,
-      sizes: Array.isArray(v.sizes)
-        ? v.sizes
-          .map((s) => ({ label: (s.label || "").trim(), stock: Number(s.stock || 0) }))
-          .filter((s) => s.label)
-        : [],
-      primary: Boolean(v.primary),
+      label: String(v.label || v.weight || v.size || "").trim(), // e.g., "500g", "1kg"
+      stock: Math.max(0, Number(v.stock || v.quantity || 0)),
+      price: v.price != null ? Number(v.price) : 0,
+      originalPrice: v.originalPrice != null ? Number(v.originalPrice) : v.price != null ? Number(v.price) : 0,
+      selling_price: v.selling_price != null ? Number(v.selling_price) : v.price != null ? Number(v.price) : 0,
+      image: v.image || v.existingImage || undefined,
     }))
-    .filter((v) => v.color);
+    .filter((v) => v.label);
 };
 
-const validateColorVariants = (cvs) => {
-  if (!cvs.length) return "At least one color is required.";
-  for (const cv of cvs) {
-    const imgCount = cv.images?.length || cv.imageCount || 0;
-    if (imgCount < 5) return `Color ${cv.color} needs at least 5 images.`;
-    if (!cv.sizes.length) return `Color ${cv.color} needs at least 1 size.`;
+const validateWeightVariants = (wvs) => {
+  if (!wvs.length) return null; // Weight variants optional
+  for (const wv of wvs) {
+    if (!wv.label) return "Each variant must have a weight label (e.g., 500g, 1kg).";
+    if (wv.price <= 0) return `Variant ${wv.label} must have a price greater than 0.`;
   }
   return null;
 };
 
-const applyColorVariantsToDoc = (doc, cvs) => {
-  doc.colorVariants = cvs;
-  doc.colors = cvs.map((c) => c.color);
-  const sizeSet = new Set();
-  cvs.forEach((c) => c.sizes.forEach((s) => sizeSet.add(s.label)));
-  doc.sizes = Array.from(sizeSet);
-  doc.product_image = cvs[0]?.images || [];
-  doc.image_public_ids = [];
-  doc.video_url = cvs[0]?.video || "";
-  doc.video_public_id = "";
-  // total quantity = sum of size stocks
-  const totalQty = cvs.reduce(
-    (sum, c) => sum + c.sizes.reduce((acc, s) => acc + (Number.isFinite(s.stock) ? s.stock : 0), 0),
-    0
-  );
+const applyWeightVariantsToDoc = (doc, wvs) => {
+  doc.variants = wvs;
+  // total quantity = sum of all variant stocks
+  const totalQty = wvs.reduce((sum, v) => sum + (Number.isFinite(v.stock) ? v.stock : 0), 0);
   doc.quantity = totalQty;
+  // Use first variant price as default if not set
+  if (wvs.length > 0 && !doc.price) {
+    doc.price = wvs[0].price;
+    doc.selling_price = wvs[0].selling_price || wvs[0].price;
+  }
 };
 
 const validateMediaRules = ({ status, imagesCount, videoCount }) => {
@@ -474,7 +473,7 @@ const validateMediaRules = ({ status, imagesCount, videoCount }) => {
     return "Maximum 10 images allowed.";
   }
   if (status === "published") {
-    if (imagesCount < 5) return "At least 5 images are required to publish.";
+    if (imagesCount < 1) return "At least 1 image is required to publish.";
   }
   return null;
 };
@@ -554,6 +553,9 @@ const normalizeFiles = (files) => {
 const uploadProduct = async (req, res) => {
   try {
     const files = normalizeFiles(req.files);
+    // Handle multiple possible field names from uploadProductFiles
+    const imageFiles = files.images || files.image || files.files || [];
+    const videoFile = files.video ? files.video[0] : null;
     const variantImageFiles = files.variantImages || [];
     const {
       name,
@@ -566,6 +568,9 @@ const uploadProduct = async (req, res) => {
       status: rawStatus,
       draft_stage,
       variants: rawVariants,
+      sku,
+      ingredients,
+      nutritions,
     } = req.body;
 
     const status = (rawStatus || "draft").toLowerCase();
@@ -606,28 +611,58 @@ const uploadProduct = async (req, res) => {
       }
     }
 
-    // Parse variants from JSON if sent as string
-    let variants = [];
-    if (typeof rawVariants === "string") {
-      try {
-        variants = JSON.parse(rawVariants);
-      } catch {
-        return res.status(400).json({ status: false, message: "Invalid variants JSON" });
+    // Parse weight variants
+    const weightVariants = parseWeightVariants(rawVariants || req.body.variants);
+    if (weightVariants.length) {
+      const wvError = validateWeightVariants(weightVariants);
+      if (wvError) {
+        return res.status(400).json({ status: false, message: wvError });
       }
-    } else if (Array.isArray(rawVariants)) {
-      variants = rawVariants;
     }
 
-    // Attach images to each variant
-    let imgPtr = 0;
-    for (let v of variants) {
-      const imgFile = variantImageFiles[imgPtr];
-      if (imgFile) {
-        const uploaded = await uploadToCloudinary(imgFile.path, "products/variants");
-        v.image = uploaded.secure_url;
-        v.imagePublicId = uploaded.public_id;
-        imgPtr += 1;
+    // Upload per-variant images
+    let variantImageUrls = [];
+    if (variantImageFiles.length > 0) {
+      for (let i = 0; i < Math.min(variantImageFiles.length, weightVariants.length); i++) {
+        const file = variantImageFiles[i];
+        const uploadRes = await uploadToCloudinary(
+          file.buffer,
+          `variant-${Date.now()}-${file.originalname}`,
+          file.mimetype
+        );
+        variantImageUrls.push(uploadRes.secure_url);
+        // Attach image to corresponding variant
+        weightVariants[i].image = uploadRes.secure_url;
+        weightVariants[i].imagePublicId = uploadRes.public_id;
       }
+    }
+
+    // Upload product images (if no variants or additional images)
+    let imageUrls = [];
+    let publicIds = [];
+    if (imageFiles.length > 0 && weightVariants.length === 0) {
+      for (const file of imageFiles) {
+        const uploadRes = await uploadToCloudinary(
+          file.buffer,
+          `product-${Date.now()}-${file.originalname}`,
+          file.mimetype
+        );
+        imageUrls.push(uploadRes.secure_url);
+        publicIds.push(uploadRes.public_id);
+      }
+    }
+
+    // Upload video if provided
+    let videoUrl = "";
+    let videoPublicId = "";
+    if (videoFile) {
+      const uploadRes = await uploadToCloudinary(
+        videoFile.buffer,
+        `product-video-${Date.now()}-${videoFile.originalname}`,
+        videoFile.mimetype
+      );
+      videoUrl = uploadRes.secure_url;
+      videoPublicId = uploadRes.public_id;
     }
 
     const productId = await getNextSequence("product_id");
@@ -640,22 +675,40 @@ const uploadProduct = async (req, res) => {
       catagory_id: finalCategory._id,
       specifications: specsArr,
       key_highlights: highlightsArr,
-      variants,
+      product_image: imageUrls,
+      image_public_ids: publicIds,
+      video_url: videoUrl,
+      video_public_id: videoPublicId,
+      variants: weightVariants,
+      sku,
+      ingredients: ingredients ? JSON.parse(ingredients) : [],
+      nutritions: nutritions ? JSON.parse(nutritions) : [],
       status,
       draft_stage: draft_stage || (status === "published" ? "complete" : "details"),
     });
 
+    // Apply variants to set quantity and price if not set
+    if (weightVariants.length) {
+      applyWeightVariantsToDoc(newProduct, weightVariants);
+    }
+
     await newProduct.save();
 
-    notifySubscribersProductUploaded(newProduct.toObject())
-      .then((result) => {
-        if (result?.total) {
-          console.log("product upload campaign:", result);
-        }
-      })
-      .catch((err) => {
-        console.error("notifySubscribersProductUploaded error:", err?.message || err);
-      });
+    // Notify subscribers (fire and forget - doesn't return promise)
+    try {
+      const result = notifySubscribersProductUploaded(newProduct.toObject());
+      if (result && typeof result.then === 'function') {
+        result.then((res) => {
+          if (res?.total) {
+            console.log("product upload campaign:", res);
+          }
+        }).catch((err) => {
+          console.error("notifySubscribersProductUploaded error:", err?.message || err);
+        });
+      }
+    } catch (err) {
+      console.error("notifySubscribersProductUploaded error:", err?.message || err);
+    }
 
     res.status(201).json({
       message: status === "published" ? "Product published successfully!" : "Draft saved successfully!",
@@ -670,10 +723,9 @@ const uploadProduct = async (req, res) => {
 // ------- Drafts -------
 const createDraftProduct = async (req, res) => {
   const files = normalizeFiles(req.files);
-  const imageFiles = files.images || [];
-  const videoFile = files.video?.[0];
+  const imageFiles = files.images || files.image || files.files || [];
+  const videoFile = files.video ? files.video[0] : null;
   const variantImageFiles = files.variantImages || [];
-  const variantVideoFiles = files.variantVideos || [];
 
   const {
     name,
@@ -688,12 +740,12 @@ const createDraftProduct = async (req, res) => {
     selling_price,
     selling_price_link,
     key_highlights,
-    colors,
-    sizes,
     draft_stage,
-    colorVariants: rawColorVariants,
+    variants: rawVariants,
+    ingredients,
+    nutritions,
   } = req.body;
-  const colorVariants = parseColorVariants(rawColorVariants || req.body.color_variants);
+  const weightVariants = parseWeightVariants(rawVariants || req.body.variants);
 
   try {
     const providedCategoryId = categoryId || req.body.catagory_id;
@@ -715,11 +767,16 @@ const createDraftProduct = async (req, res) => {
       } catch {
         return res.status(400).json({ message: "Invalid specification JSON" });
       }
-      if (specsArr.length < SPECIFICATIONS_MIN || specsArr.length > SPECIFICATIONS_MAX) {
-        return res.status(400).json({
-          status: false,
-          message: `specifications must have ${SPECIFICATIONS_MIN}-${SPECIFICATIONS_MAX} items`,
-        });
+      // Only validate specifications length if a new, non-empty `specification`
+      // payload was provided in the request body. This matches the upload flow
+      // where specs are only enforced when explicitly sent by the client.
+      if (specification) {
+        if (specsArr.length < SPECIFICATIONS_MIN || specsArr.length > SPECIFICATIONS_MAX) {
+          return res.status(400).json({
+            status: false,
+            message: `specifications must have ${SPECIFICATIONS_MIN}-${SPECIFICATIONS_MAX} items`,
+          });
+        }
       }
     }
     let highlightsArr = parseHighlights(key_highlights);
@@ -729,24 +786,23 @@ const createDraftProduct = async (req, res) => {
         .json({ status: false, message: "key_highlights must have 6-10 items" });
     }
 
-    if (colorVariants.length) {
-      let imgPtr = 0;
-      let vidPtr = 0;
-      colorVariants.forEach((cv) => {
-        if (!cv.imageCount) cv.imageCount = Number(cv.images?.length || 0);
-        if (cv.imageCount === 0) {
-          const remaining = variantImageFiles.length - imgPtr;
-          cv.imageCount = remaining > 0 ? remaining : 0;
-        }
-        if (!cv.hasVideo) {
-          cv.hasVideo = !!cv.video || !!variantVideoFiles[vidPtr];
-          vidPtr += cv.hasVideo ? 1 : 0;
-        }
-        imgPtr += cv.imageCount || 0;
-      });
-      const cvError = validateColorVariants(colorVariants);
-      if (cvError) {
-        return res.status(400).json({ status: false, message: cvError });
+    // Validate weight variants
+    const wvError = validateWeightVariants(weightVariants);
+    if (wvError) {
+      return res.status(400).json({ status: false, message: wvError });
+    }
+
+    // Upload per-variant images
+    if (variantImageFiles.length > 0 && weightVariants.length > 0) {
+      for (let i = 0; i < Math.min(variantImageFiles.length, weightVariants.length); i++) {
+        const file = variantImageFiles[i];
+        const uploadRes = await uploadToCloudinary(
+          file.buffer,
+          `variant-${Date.now()}-${file.originalname}`,
+          file.mimetype
+        );
+        weightVariants[i].image = uploadRes.secure_url;
+        weightVariants[i].imagePublicId = uploadRes.public_id;
       }
     }
 
@@ -768,33 +824,14 @@ const createDraftProduct = async (req, res) => {
       catagory_id: finalCategory?._id,
       specifications: specsArr,
       key_highlights: highlightsArr,
-      colors: parseArrayField(colors),
-      sizes: parseArrayField(sizes),
+      ingredients: ingredients ? JSON.parse(ingredients) : [],
+      nutritions: nutritions ? JSON.parse(nutritions) : [],
       draft_stage: draft_stage || stageFromLabel(draft_stage) || "details",
       status: "draft",
     });
 
-    if (colorVariants.length) {
-      let imgPtr = 0;
-      let vidPtr = 0;
-      for (const cv of colorVariants) {
-        const imgs = variantImageFiles.slice(imgPtr, imgPtr + (cv.imageCount || 0));
-        const vid = variantVideoFiles[vidPtr] || null;
-        let uploaded = { images: [], video: "" };
-        if (imgs.length || vid) {
-          uploaded = await uploadVariantMedia({
-            productId: `draft-${draftId}`,
-            color: cv.color,
-            images: imgs,
-            video: vid,
-          });
-        }
-        cv.images = imgs.length ? uploaded.images : cv.images || [];
-        cv.video = vid ? uploaded.video : cv.video || "";
-        imgPtr += cv.imageCount || 0;
-        if (vid) vidPtr += 1;
-      }
-      applyColorVariantsToDoc(draft, colorVariants);
+    if (weightVariants.length) {
+      applyWeightVariantsToDoc(draft, weightVariants);
     } else {
       const { imageUrls, imagePublicIds, videoUrl, videoPublicId } = await uploadMedia({
         productId: `draft-${draftId}`,
@@ -817,72 +854,78 @@ const createDraftProduct = async (req, res) => {
 };
 
 const updateProduct = async (req, res) => {
-  const { product_id } = req.params;
-  const files = normalizeFiles(req.files);
-  const imageFiles = files.images || [];
-  const videoFile = files.video?.[0];
-  const variantImageFiles = files.variantImages || [];
-  const variantVideoFiles = files.variantVideos || [];
-  const removedImageUrls = parseArrayField(req.body.removedImageUrls || req.body.removed_image_urls);
-  const removeVideoFlag = req.body.removeVideo === "true";
-  const {
-    name,
-    title,
-    price,
-    quantity,
-    sku,
-    description,
-    catagory,
-    categoryId,
-    specification,
-    selling_price,
-    selling_price_link,
-    key_highlights,
-    colors,
-    sizes,
-    status: rawStatus,
-    draft_stage,
-    colorVariants: rawColorVariants,
-  } = req.body;
-  const colorVariants = parseColorVariants(rawColorVariants || req.body.color_variants);
+  try {
+    const { product_id } = req.params;
+    const files = normalizeFiles(req.files);
+    // Handle multiple possible field names from uploadProductFiles
+    const imageFiles = files.images || files.image || files.files || [];
+    const videoFile = files.video ? files.video[0] : null;
+    const variantImageFiles = files.variantImages || [];
+    const removedImageUrls = parseArrayField(req.body.removedImageUrls || req.body.removed_image_urls);
+    const removeVideoFlag = req.body.removeVideo === "true";
+    const {
+      name,
+      title,
+      price,
+      quantity,
+      sku,
+      description,
+      catagory,
+      categoryId,
+      specification,
+      selling_price,
+      selling_price_link,
+      key_highlights,
+      status: rawStatus,
+      draft_stage,
+      variants: rawVariants,
+      ingredients,
+      nutritions,
+    } = req.body;
 
-  const status = rawStatus ? rawStatus.toLowerCase() : undefined;
+    console.log('Update product request body:', { name, sku, ingredients, nutritions, rawVariants });
+    const weightVariants = parseWeightVariants(rawVariants || req.body.variants);
 
-  if (description !== undefined) {
-    const descLength = descriptionTextLength(description);
-    if (descLength > DESCRIPTION_MAX_LENGTH) {
+    const status = rawStatus ? rawStatus.toLowerCase() : undefined;
+
+    if (description !== undefined) {
+      const descLength = descriptionTextLength(description);
+      if (descLength > DESCRIPTION_MAX_LENGTH) {
+        console.log('Validation failed: description too long', descLength);
+        return res.status(400).json({
+          status: false,
+          message: `description must be ${DESCRIPTION_MAX_LENGTH} characters or less`,
+        });
+      }
+    }
+
+    const hasPrice = price !== undefined && price !== null && String(price).trim() !== "";
+    const hasSellingPrice =
+      selling_price !== undefined && selling_price !== null && String(selling_price).trim() !== "";
+    const hasSku = sku !== undefined && sku !== null && String(sku).trim() !== "";
+    const parsedSku = hasSku ? normalizeSku(sku) : undefined;
+    const parsedPrice = hasPrice ? Number(price) : undefined;
+    const parsedSellingPrice = hasSellingPrice ? Number(selling_price) : undefined;
+
+    if (hasSku && !isValidSku(parsedSku)) {
+      console.log('Validation failed: invalid SKU format', parsedSku);
       return res.status(400).json({
         status: false,
-        message: `description must be ${DESCRIPTION_MAX_LENGTH} characters or less`,
+        message: "sku format must be AA-123 (2 uppercase letters, hyphen, 3 digits)",
       });
     }
-  }
 
-  const hasPrice = price !== undefined && price !== null && String(price).trim() !== "";
-  const hasSellingPrice =
-    selling_price !== undefined && selling_price !== null && String(selling_price).trim() !== "";
-  const hasSku = sku !== undefined && sku !== null && String(sku).trim() !== "";
-  const parsedSku = hasSku ? normalizeSku(sku) : undefined;
-  const parsedPrice = hasPrice ? Number(price) : undefined;
-  const parsedSellingPrice = hasSellingPrice ? Number(selling_price) : undefined;
+    if (hasPrice && (!Number.isFinite(parsedPrice) || parsedPrice <= 0)) {
+      console.log('Validation failed: invalid price', parsedPrice);
+      return res.status(400).json({ status: false, message: "price must be a valid number greater than 0" });
+    }
+    if (hasSellingPrice && (!Number.isFinite(parsedSellingPrice) || parsedSellingPrice < 0)) {
+      console.log('Validation failed: invalid selling_price', parsedSellingPrice);
+      return res
+        .status(400)
+        .json({ status: false, message: "selling_price must be a valid number" });
+    }
 
-  if (hasSku && !isValidSku(parsedSku)) {
-    return res.status(400).json({
-      status: false,
-      message: "sku format must be AA-123 (2 uppercase letters, hyphen, 3 digits)",
-    });
-  }
-
-  if (hasPrice && (!Number.isFinite(parsedPrice) || parsedPrice <= 0)) {
-    return res.status(400).json({ status: false, message: "price must be a valid number greater than 0" });
-  }
-  if (hasSellingPrice && (!Number.isFinite(parsedSellingPrice) || parsedSellingPrice < 0)) {
-    return res
-      .status(400)
-      .json({ status: false, message: "selling_price must be a valid number" });
-  }
-
-  try {
     const product = await Products.findOne({ product_id: Number(product_id) });
     if (!product) {
       return res
@@ -904,11 +947,9 @@ const updateProduct = async (req, res) => {
     if (!categoryData) {
       categoryData = await Catagories.findById(product.catagory_id);
     }
+    // If still no category, skip category update (allow partial updates)
     if (!categoryData) {
-      return res.status(400).json({
-        status: false,
-        message: "Valid categoryId is required to update the product",
-      });
+      console.warn('No valid category found, skipping category update for product:', product_id);
     }
 
     let specsArr = product.specifications || [];
@@ -934,24 +975,11 @@ const updateProduct = async (req, res) => {
       }
     }
 
-    if (colorVariants.length) {
-      let imgPtr = 0;
-      let vidPtr = 0;
-      colorVariants.forEach((cv) => {
-        if (!cv.imageCount) cv.imageCount = Number(cv.images?.length || 0);
-        if (cv.imageCount === 0) {
-          const remaining = variantImageFiles.length - imgPtr;
-          cv.imageCount = remaining > 0 ? remaining : 0;
-        }
-        if (!cv.hasVideo) {
-          cv.hasVideo = !!cv.video || !!variantVideoFiles[vidPtr];
-          vidPtr += cv.hasVideo ? 1 : 0;
-        }
-        imgPtr += cv.imageCount || 0;
-      });
-      const cvError = validateColorVariants(colorVariants);
-      if (cvError) {
-        return res.status(400).json({ status: false, message: cvError });
+    if (weightVariants.length) {
+      // Validate weight variants
+      const wvError = validateWeightVariants(weightVariants);
+      if (wvError) {
+        return res.status(400).json({ status: false, message: wvError });
       }
     }
 
@@ -959,7 +987,7 @@ const updateProduct = async (req, res) => {
     let currentImages = product.product_image || [];
     let currentPublicIds = product.image_public_ids || [];
 
-    if (!colorVariants.length && removedImageUrls.length) {
+    if (!weightVariants.length && removedImageUrls.length) {
       const nextImages = [];
       const nextPublic = [];
       currentImages.forEach((url, idx) => {
@@ -981,22 +1009,19 @@ const updateProduct = async (req, res) => {
 
     // validate media constraints based on target status
     const targetStatus = status || product.status || "draft";
-    const plannedImageCount = colorVariants.length
-      ? colorVariants[0].imageCount || 0
-      : imageFiles.length > 0
-        ? imageFiles.length
-        : currentImages.length;
-    const plannedVideoCount = colorVariants.length
-      ? colorVariants[0].hasVideo
-        ? 1
-        : 0
-      : videoFile
-        ? 1
-        : removeVideoFlag
-          ? 0
-          : product.video_url
-            ? 1
-            : 0;
+    const variantImagesFromPayloadCount = Array.isArray(weightVariants) && weightVariants.length
+      ? weightVariants.filter((v) => v && v.image).length
+      : 0;
+    const plannedImageCount = imageFiles.length > 0 || variantImageFiles.length > 0 || variantImagesFromPayloadCount > 0
+      ? imageFiles.length + variantImageFiles.length + variantImagesFromPayloadCount
+      : currentImages.length;
+    const plannedVideoCount = videoFile
+      ? 1
+      : removeVideoFlag
+        ? 0
+        : product.video_url
+          ? 1
+          : 0;
     const mediaError = validateMediaRules({
       status: targetStatus,
       imagesCount: plannedImageCount,
@@ -1007,31 +1032,46 @@ const updateProduct = async (req, res) => {
     }
 
     if (targetStatus === "published") {
-      if (
-        !(name ?? product.name) ||
-        !(price ?? product.price) ||
-        !(selling_price ?? product.selling_price) ||
-        !(quantity ?? product.quantity) ||
-        !(sku ?? product.sku)
-      ) {
+      // Compute effective values taking variants into account so variant-driven
+      // products can be published without explicit top-level price/quantity fields.
+      const effectiveName = String((name ?? product.name) || "").trim();
+      const effectiveSku = hasSku ? parsedSku : normalizeSku(product.sku || "");
+
+      let effectivePriceVal;
+      let effectiveSellingPriceVal;
+      let effectiveQuantityVal;
+
+      if (Array.isArray(weightVariants) && weightVariants.length) {
+        effectiveQuantityVal = weightVariants.reduce((sum, v) => sum + (Number.isFinite(Number(v.stock)) ? Number(v.stock) : 0), 0);
+        effectivePriceVal = hasPrice ? parsedPrice : Number(weightVariants[0].price || product.price || 0);
+        effectiveSellingPriceVal = hasSellingPrice ? parsedSellingPrice : Number((weightVariants[0].selling_price ?? weightVariants[0].price) || product.selling_price || 0);
+      } else {
+        effectiveQuantityVal = quantity !== undefined ? Number(quantity) : Number(product.quantity || 0);
+        effectivePriceVal = hasPrice ? parsedPrice : Number(product.price || 0);
+        effectiveSellingPriceVal = hasSellingPrice ? parsedSellingPrice : Number(product.selling_price || 0);
+      }
+
+      if (!effectiveName || !effectiveSku || !Number.isFinite(effectivePriceVal) || !Number.isFinite(effectiveSellingPriceVal) || !Number.isFinite(effectiveQuantityVal) || effectiveQuantityVal <= 0) {
         return res.status(400).json({
           status: false,
           message: "name, price, selling_price, quantity, sku are required to publish",
         });
       }
 
-      const effectiveSku = hasSku ? parsedSku : normalizeSku(product.sku);
       if (!isValidSku(effectiveSku)) {
         return res.status(400).json({
           status: false,
           message: "sku format must be AA-123 (2 uppercase letters, hyphen, 3 digits)",
         });
       }
-      if (specsArr.length < SPECIFICATIONS_MIN || specsArr.length > SPECIFICATIONS_MAX) {
-        return res.status(400).json({
-          status: false,
-          message: `specifications must have ${SPECIFICATIONS_MIN}-${SPECIFICATIONS_MAX} items`,
-        });
+
+      if (specification) {
+        if (specsArr.length < SPECIFICATIONS_MIN || specsArr.length > SPECIFICATIONS_MAX) {
+          return res.status(400).json({
+            status: false,
+            message: `specifications must have ${SPECIFICATIONS_MIN}-${SPECIFICATIONS_MAX} items`,
+          });
+        }
       }
     }
 
@@ -1052,64 +1092,63 @@ const updateProduct = async (req, res) => {
     let videoUrl = product.video_url;
     let videoPublicId = product.video_public_id;
 
-    if (!colorVariants.length) {
-      if (imageFiles.length > 0) {
-        for (const pid of publicIds) {
-          try {
-            await deleteFromCloudinary(pid);
-          } catch (err) {
-            console.warn("Failed to delete old image:", pid, err.message);
-          }
+    // Handle image uploads for product (not per variant)
+    if (imageFiles.length > 0) {
+      for (const pid of publicIds) {
+        try {
+          await deleteFromCloudinary(pid);
+        } catch (err) {
+          console.warn("Failed to delete old image:", pid, err.message);
         }
-        imageUrls = [];
-        publicIds = [];
-        for (const file of imageFiles) {
-          const uploadRes = await uploadToCloudinary(
-            file.buffer,
-            `${product.product_id}-${file.originalname}`,
-            file.mimetype
-          );
-          imageUrls.push(uploadRes.secure_url);
-          publicIds.push(uploadRes.public_id);
-        }
-      } else if (req.body.removeImages === "true" || (removedImageUrls.length && imageFiles.length === 0)) {
-        for (const pid of publicIds) {
-          try {
-            await deleteFromCloudinary(pid);
-          } catch (err) {
-            console.warn("Failed to delete old image:", pid, err.message);
-          }
-        }
-        imageUrls = [];
-        publicIds = [];
       }
-
-      if (videoFile) {
-        if (videoPublicId) {
-          try {
-            await deleteFromCloudinary(videoPublicId);
-          } catch (err) {
-            console.warn("Failed to delete old video:", videoPublicId, err.message);
-          }
-        }
+      imageUrls = [];
+      publicIds = [];
+      for (const file of imageFiles) {
         const uploadRes = await uploadToCloudinary(
-          videoFile.buffer,
-          `${product.product_id}-${videoFile.originalname}`,
-          videoFile.mimetype
+          file.buffer,
+          `${product.product_id}-${file.originalname}`,
+          file.mimetype
         );
-        videoUrl = uploadRes.secure_url;
-        videoPublicId = uploadRes.public_id;
-      } else if (removeVideoFlag) {
-        if (videoPublicId) {
-          try {
-            await deleteFromCloudinary(videoPublicId);
-          } catch (err) {
-            console.warn("Failed to delete old video:", videoPublicId, err.message);
-          }
-        }
-        videoUrl = "";
-        videoPublicId = "";
+        imageUrls.push(uploadRes.secure_url);
+        publicIds.push(uploadRes.public_id);
       }
+    } else if (req.body.removeImages === "true" || (removedImageUrls.length && imageFiles.length === 0)) {
+      for (const pid of publicIds) {
+        try {
+          await deleteFromCloudinary(pid);
+        } catch (err) {
+          console.warn("Failed to delete old image:", pid, err.message);
+        }
+      }
+      imageUrls = [];
+      publicIds = [];
+    }
+
+    if (videoFile) {
+      if (videoPublicId) {
+        try {
+          await deleteFromCloudinary(videoPublicId);
+        } catch (err) {
+          console.warn("Failed to delete old video:", videoPublicId, err.message);
+        }
+      }
+      const uploadRes = await uploadToCloudinary(
+        videoFile.buffer,
+        `${product.product_id}-${videoFile.originalname}`,
+        videoFile.mimetype
+      );
+      videoUrl = uploadRes.secure_url;
+      videoPublicId = uploadRes.public_id;
+    } else if (removeVideoFlag) {
+      if (videoPublicId) {
+        try {
+          await deleteFromCloudinary(videoPublicId);
+        } catch (err) {
+          console.warn("Failed to delete old video:", videoPublicId, err.message);
+        }
+      }
+      videoUrl = "";
+      videoPublicId = "";
     }
 
     product.title = (title ?? name) || product.title;
@@ -1127,38 +1166,22 @@ const updateProduct = async (req, res) => {
     product.key_highlights = highlightsArr;
     product.video_url = videoUrl;
     product.video_public_id = videoPublicId;
-    if (colorVariants.length) {
-      if (product.image_public_ids?.length) {
-        for (const pid of product.image_public_ids) {
-          deleteFromCloudinary(pid).catch(() => { });
+    function safeParseArray(val) {
+      if (Array.isArray(val)) return val;
+      if (typeof val === "string") {
+        try {
+          return JSON.parse(val);
+        } catch {
+          return [];
         }
       }
-      if (product.video_public_id) {
-        deleteFromCloudinary(product.video_public_id).catch(() => { });
-      }
-      let imgPtr = 0;
-      let vidPtr = 0;
-      for (const cv of colorVariants) {
-        const imgs = variantImageFiles.slice(imgPtr, imgPtr + (cv.imageCount || 0));
-        const vid = variantVideoFiles[vidPtr] || null;
-        let uploaded = { images: [], video: "" };
-        if (imgs.length || vid) {
-          uploaded = await uploadVariantMedia({
-            productId: product.product_id,
-            color: cv.color,
-            images: imgs,
-            video: vid,
-          });
-        }
-        cv.images = imgs.length ? uploaded.images : cv.images || [];
-        cv.video = vid ? uploaded.video : cv.video || "";
-        imgPtr += cv.imageCount || 0;
-        if (vid) vidPtr += 1;
-      }
-      applyColorVariantsToDoc(product, colorVariants);
-    } else {
-      if (colors !== undefined) product.colors = parseArrayField(colors);
-      if (sizes !== undefined) product.sizes = parseArrayField(sizes);
+      return [];
+    }
+    if (ingredients !== undefined) product.ingredients = safeParseArray(ingredients);
+    if (nutritions !== undefined) product.nutritions = safeParseArray(nutritions);
+    // Apply weight variants if provided
+    if (weightVariants.length) {
+      applyWeightVariantsToDoc(product, weightVariants);
     }
     if (status) product.status = status;
     if (draft_stage) product.draft_stage = draft_stage;
@@ -1167,9 +1190,7 @@ const updateProduct = async (req, res) => {
 
     const currentQuantity = Number(product.quantity || 0);
     if (previousQuantity <= 0 && currentQuantity > 0) {
-      notifySubscribersProductInStock(product.toObject()).catch((err) => {
-        console.error("notifySubscribersProductInStock error:", err?.message || err);
-      });
+      safeFireAndForget(() => notifySubscribersProductInStock(product.toObject()), "notifySubscribersProductInStock");
     }
 
     const currentVariantStockMap = buildVariantStockMap(product.toObject());
@@ -1186,43 +1207,35 @@ const updateProduct = async (req, res) => {
         const [colorKey, sizeKey] = key.split("|");
 
         if (before <= 0 && after > 0) {
-          notifyProductWaitlistForVariant({
+          safeFireAndForget(() => notifyProductWaitlistForVariant({
             product: product.toObject(),
             color: colorKey,
             size: sizeKey,
-          }).catch((err) => {
-            console.error("notifyProductWaitlistForVariant error:", err?.message || err);
-          });
+          }), "notifyProductWaitlistForVariant");
         }
 
         if (before > 0 && after <= 0) {
-          resetProductWaitlistForVariant({
+          safeFireAndForget(() => resetProductWaitlistForVariant({
             productId: product.product_id,
             color: colorKey,
             size: sizeKey,
-          }).catch((err) => {
-            console.error("resetProductWaitlistForVariant error:", err?.message || err);
-          });
+          }), "resetProductWaitlistForVariant");
         }
       });
     } else {
       if (previousQuantity <= 0 && currentQuantity > 0) {
-        notifyProductWaitlistIfRestocked({
+        safeFireAndForget(() => notifyProductWaitlistIfRestocked({
           previousQuantity,
           product: product.toObject(),
-        }).catch((err) => {
-          console.error("notifyProductWaitlistIfRestocked error:", err?.message || err);
-        });
+        }), "notifyProductWaitlistIfRestocked");
       }
 
       if (previousQuantity > 0 && currentQuantity <= 0) {
-        resetProductWaitlistIfOutOfStock({
+        safeFireAndForget(() => resetProductWaitlistIfOutOfStock({
           previousQuantity,
           currentQuantity,
           productId: product.product_id,
-        }).catch((err) => {
-          console.error("resetProductWaitlistIfOutOfStock error:", err?.message || err);
-        });
+        }), "resetProductWaitlistIfOutOfStock");
       }
     }
 
@@ -1231,6 +1244,10 @@ const updateProduct = async (req, res) => {
       .json({ status: true, message: "Product updated successfully", product });
   } catch (error) {
     console.error("updateProduct error:", error);
+    console.error("Error details:", {
+      message: error.message,
+      stack: error.stack,
+    });
     res
       .status(500)
       .json({ status: false, message: "Server error", error: error.message });
@@ -1355,22 +1372,35 @@ const searchProducts = async (req, res) => {
 
 const deleteProduct = async (req, res) => {
   try {
-    const { productId } = req.body;
-    if (!productId)
+    const fromBody = req.body?.productId ?? req.body?.product_id;
+    const fromQuery = req.query?.productId ?? req.query?.product_id;
+    const idCandidate = String(req.body?.id || req.query?.id || "").trim();
+    const productId = Number(fromBody ?? fromQuery);
+    const hasNumericId = Number.isFinite(productId) && productId > 0;
+    const hasMongoId = /^[a-f\d]{24}$/i.test(idCandidate);
+    if (!hasNumericId && !hasMongoId)
       return res
-        .status(404)
-        .json({ status: false, Message: "Cannot remove product." });
+        .status(400)
+        .json({ status: false, message: "Valid productId or id is required." });
 
-    const product = await Products.findOne({ product_id: Number(productId) });
+    const product = hasNumericId
+      ? await Products.findOne({ product_id: productId })
+      : await Products.findById(idCandidate);
     if (!product) {
       return res
         .status(404)
-        .json({ status: false, Message: "Product not found" });
+        .json({ status: false, message: "Product not found" });
     }
 
-    const publicIds = product.image_public_ids?.length
-      ? product.image_public_ids
-      : product.product_image
+    const imagePublicIds = Array.isArray(product.image_public_ids)
+      ? product.image_public_ids.filter(Boolean)
+      : [];
+    const productImages = Array.isArray(product.product_image)
+      ? product.product_image
+      : [];
+    const publicIds = imagePublicIds.length
+      ? imagePublicIds
+      : productImages
         .map((url) => extractPublicId(url))
         .filter(Boolean);
 
@@ -1394,10 +1424,10 @@ const deleteProduct = async (req, res) => {
 
     res
       .status(200)
-      .json({ status: true, Message: "Product Deleted successfully" });
+      .json({ status: true, message: "Product deleted successfully" });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ status: false, Message: "Something went wrong" });
+    res.status(500).json({ status: false, message: "Something went wrong" });
   }
 };
 
@@ -1414,10 +1444,9 @@ const getDrafts = async (_req, res) => {
 const updateDraft = async (req, res) => {
   const { draft_id } = req.params;
   const files = normalizeFiles(req.files);
-  const imageFiles = files.images || [];
-  const videoFile = files.video?.[0];
+  const imageFiles = files.images || files.image || files.files || [];
+  const videoFile = files.video ? files.video[0] : null;
   const variantImageFiles = files.variantImages || [];
-  const variantVideoFiles = files.variantVideos || [];
   const removedImageUrls = parseArrayField(req.body.removedImageUrls || req.body.removed_image_urls);
   const removeVideoFlag = req.body.removeVideo === "true";
   const {
@@ -1432,13 +1461,13 @@ const updateDraft = async (req, res) => {
     selling_price,
     selling_price_link,
     key_highlights,
-    colors,
-    sizes,
     status: rawStatus,
     draft_stage,
-    colorVariants: rawColorVariants,
+    variants: rawVariants,
+    ingredients,
+    nutritions,
   } = req.body;
-  const colorVariants = parseColorVariants(rawColorVariants || req.body.color_variants);
+  const weightVariants = parseWeightVariants(rawVariants || req.body.variants);
 
   try {
     const draft = await DraftProducts.findOne({ draft_id: Number(draft_id) });
@@ -1477,31 +1506,18 @@ const updateDraft = async (req, res) => {
       }
     }
 
-    if (colorVariants.length) {
-      let imgPtr = 0;
-      let vidPtr = 0;
-      colorVariants.forEach((cv) => {
-        if (!cv.imageCount) cv.imageCount = Number(cv.images?.length || 0);
-        if (cv.imageCount === 0) {
-          const remaining = variantImageFiles.length - imgPtr;
-          cv.imageCount = remaining > 0 ? remaining : 0;
-        }
-        if (!cv.hasVideo) {
-          cv.hasVideo = !!cv.video || !!variantVideoFiles[vidPtr];
-          vidPtr += cv.hasVideo ? 1 : 0;
-        }
-        imgPtr += cv.imageCount || 0;
-      });
-      const cvError = validateColorVariants(colorVariants);
-      if (cvError) {
-        return res.status(400).json({ status: false, message: cvError });
+    // Validate weight variants
+    if (weightVariants.length) {
+      const wvError = validateWeightVariants(weightVariants);
+      if (wvError) {
+        return res.status(400).json({ status: false, message: wvError });
       }
     }
 
     // validate media constraints against planned state
     let currentImages = draft.product_image || [];
     let currentPublic = draft.image_public_ids || [];
-    if (!colorVariants.length && removedImageUrls.length) {
+    if (!weightVariants.length && removedImageUrls.length) {
       const nextImages = [];
       const nextPublic = [];
       currentImages.forEach((url, idx) => {
@@ -1521,22 +1537,19 @@ const updateDraft = async (req, res) => {
       currentPublic = nextPublic;
     }
 
-    const plannedImageCount = colorVariants.length
-      ? colorVariants[0].imageCount || 0
-      : imageFiles.length > 0
-        ? imageFiles.length
-        : currentImages.length;
-    const plannedVideoCount = colorVariants.length
-      ? colorVariants[0].hasVideo
-        ? 1
-        : 0
-      : videoFile
-        ? 1
-        : removeVideoFlag
-          ? 0
-          : draft.video_url
-            ? 1
-            : 0;
+    const variantImagesFromPayloadCount = Array.isArray(weightVariants) && weightVariants.length
+      ? weightVariants.filter((v) => v && v.image).length
+      : 0;
+    const plannedImageCount = imageFiles.length > 0 || variantImageFiles.length > 0 || variantImagesFromPayloadCount > 0
+      ? imageFiles.length + variantImageFiles.length + variantImagesFromPayloadCount
+      : currentImages.length;
+    const plannedVideoCount = videoFile
+      ? 1
+      : removeVideoFlag
+        ? 0
+        : draft.video_url
+          ? 1
+          : 0;
     const mediaError = validateMediaRules({
       status: targetStatus,
       imagesCount: plannedImageCount,
@@ -1551,7 +1564,7 @@ const updateDraft = async (req, res) => {
     let videoUrl = draft.video_url;
     let videoPublicId = draft.video_public_id;
 
-    if (!colorVariants.length) {
+    if (!weightVariants.length) {
       if (imageFiles.length > 0) {
         for (const pid of publicIds) {
           try {
@@ -1626,36 +1639,11 @@ const updateDraft = async (req, res) => {
     draft.key_highlights = highlightsArr;
     draft.video_url = videoUrl;
     draft.video_public_id = videoPublicId;
-    if (colorVariants.length) {
-      // remove stored media public ids when switching to variant uploads
-      if (draft.image_public_ids?.length) {
-        for (const pid of draft.image_public_ids) {
-          deleteFromCloudinary(pid).catch(() => { });
-        }
-      }
-      if (draft.video_public_id) {
-        deleteFromCloudinary(draft.video_public_id).catch(() => { });
-      }
-      let imgPtr = 0;
-      let vidPtr = 0;
-      for (const cv of colorVariants) {
-        const imgs = variantImageFiles.slice(imgPtr, imgPtr + (cv.imageCount || 0));
-        const vid = variantVideoFiles[vidPtr] || null;
-        let uploaded = { images: [], video: "" };
-        if (imgs.length || vid) {
-          uploaded = await uploadVariantMedia({
-            productId: `draft-${draft.draft_id}`,
-            color: cv.color,
-            images: imgs,
-            video: vid,
-          });
-        }
-        cv.images = imgs.length ? uploaded.images : cv.images || [];
-        cv.video = vid ? uploaded.video : cv.video || "";
-        imgPtr += cv.imageCount || 0;
-        if (vid) vidPtr += 1;
-      }
-      applyColorVariantsToDoc(draft, colorVariants);
+    if (ingredients !== undefined) draft.ingredients = ingredients ? JSON.parse(ingredients) : [];
+    if (nutritions !== undefined) draft.nutritions = nutritions ? JSON.parse(nutritions) : [];
+    // Apply weight variants if provided
+    if (weightVariants.length) {
+      applyWeightVariantsToDoc(draft, weightVariants);
     }
     if (draft_stage) draft.draft_stage = draft_stage;
     draft.status = targetStatus;
@@ -1667,10 +1655,10 @@ const updateDraft = async (req, res) => {
           message: "name, price, selling_price, quantity, sku are required to publish",
         });
       }
-      if (draft.colorVariants?.length) {
-        const cvErr = validateColorVariants(draft.colorVariants);
-        if (cvErr) {
-          return res.status(400).json({ status: false, message: cvErr });
+      if (draft.variants?.length) {
+        const wvErr = validateWeightVariants(draft.variants);
+        if (wvErr) {
+          return res.status(400).json({ status: false, message: wvErr });
         }
       } else {
         if (draft.product_image.length < 5 || draft.product_image.length > 10) {
@@ -1699,13 +1687,13 @@ const updateDraft = async (req, res) => {
         catagory_id: draft.catagory_id,
         specifications: draft.specifications,
         key_highlights: draft.key_highlights,
-        colors: draft.colors,
-        sizes: draft.sizes,
+        ingredients: draft.ingredients || [],
+        nutritions: draft.nutritions || [],
         status: "published",
         draft_stage: "complete",
       });
-      if (draft.colorVariants?.length) {
-        applyColorVariantsToDoc(product, draft.colorVariants);
+      if (draft.variants?.length) {
+        applyWeightVariantsToDoc(product, draft.variants);
       }
       await product.save();
       await draft.deleteOne();
@@ -1814,84 +1802,61 @@ const getCategoryTree = async (_req, res) => {
 const resolveOrderIdentifierQuery = (orderRef) => {
   const idRaw = String(orderRef || "").trim();
   if (!idRaw) return null;
-
-  const parsed = Number(idRaw);
-  if (!Number.isNaN(parsed) && Number.isFinite(parsed)) {
-    return { order_id: parsed };
+  const queries = [{ order_id: idRaw }, { order_code: idRaw }];
+  if (/^[a-f\d]{24}$/i.test(idRaw)) {
+    queries.push({ _id: idRaw });
   }
-  if (idRaw.startsWith("ORD-")) {
-    return { order_code: idRaw };
-  }
-  return { _id: idRaw };
+  return { $or: queries };
 };
 
 const getOrders = async (_req, res) => {
   try {
     const data = await Orders.find({})
-      .populate({ path: "items.product", select: "name title product_image price selling_price" })
+      .populate({ path: "items.product", select: "name title product_code product_image price selling_price" })
       .populate({ path: "address" })
       .sort({ createdAt: -1 });
 
     for (const order of data) {
-      if (!order.order_code) {
-        let code = "";
-        for (let i = 0; i < 10; i += 1) {
-          const suffix = Math.floor(10000 + Math.random() * 90000);
-          const candidate = `ORD-KNTC-${suffix}`;
-          const exists = await Orders.findOne({ order_code: candidate }).select("_id").lean();
+      if (!order.order_id || String(order.order_id).trim().length < 10) {
+        let idCandidate = "";
+        for (let i = 0; i < 15; i += 1) {
+          const candidate = createRandomAlphaNum(10);
+          const exists = await Orders.findOne({ order_id: candidate }).select("_id").lean();
           if (!exists) {
-            code = candidate;
+            idCandidate = candidate;
             break;
           }
         }
-        order.order_code = code || `ORD-KNTC-${Date.now().toString().slice(-5)}`;
-        await order.save();
+        order.order_id = idCandidate || createRandomAlphaNum(10);
       }
-    }
-
-    const statusUpdates = [];
-    const ordersWithPayment = await Promise.all(
-      data.map(async (orderDoc) => {
-        const order = orderDoc.toObject();
-        const tracking = await fetchShiprocketTrackingSnapshot({
-          awb: order.shiprocket_awb,
-          shipmentId: order.shiprocket_shipment_id,
-          shiprocketOrderId: order.shiprocket_order_id,
-          createdAt: order.createdAt,
-          fallbackStatus: order.status,
-        });
-
-        const currentStatus = String(tracking.currentStatus || order.status || "pending").trim() || "pending";
-        if (currentStatus !== order.status) {
-          statusUpdates.push(Orders.updateOne({ _id: order._id }, { status: currentStatus }));
-        }
-
-        return {
-          ...order,
-          status: currentStatus,
-          payment_method: order.payment_method || "Razorpay",
-          shiprocket: {
-            source: tracking.source,
-            currentStatus,
-            statusCode: tracking.statusCode || "",
-            statuses: Array.isArray(tracking.statuses) ? tracking.statuses : [],
-            statusHistory: Array.isArray(tracking.statusHistory) ? tracking.statusHistory : [],
-            trackingUrl: tracking.trackingUrl || "",
-            awb: tracking.awb || order.shiprocket_awb || "",
-            shipmentId: tracking.shipmentId || order.shiprocket_shipment_id || null,
-            orderId: tracking.shiprocketOrderId || order.shiprocket_order_id || null,
+      if (!order.order_code) {
+        order.order_code = String(order.order_id);
+      }
+      if (!Array.isArray(order.status_history) || order.status_history.length === 0) {
+        order.status_history = [
+          {
+            status: String(order.status || "confirmed").toLowerCase(),
+            updatedAt: order.createdAt || new Date(),
+            updatedBy: "system",
+            note: "Order created",
           },
-        };
-      }),
-    );
-
-    if (statusUpdates.length) {
-      await Promise.all(statusUpdates);
+        ];
+      }
+      await order.save();
     }
+
+    const ordersWithDetails = data.map((orderDoc) => {
+      const order = orderDoc.toObject();
+      return {
+        ...order,
+        status: order.status || "pending",
+        payment_method: order.payment_method || "Razorpay",
+      };
+    });
 
     res.status(200).json({
       status: true,
-      orders: ordersWithPayment,
+      orders: ordersWithDetails,
     });
   } catch (error) {
     console.error("Error fetching orders:", error);
@@ -1910,6 +1875,9 @@ const updateOrderStatus = async (req, res) => {
       .json({ message: "Required fields missing: status or order_id." });
   }
 
+  // Valid order statuses
+  const validStatuses = ["confirmed", "processed", "in_transit", "delivered", "rto", "return", "refund", "cancelled"];
+
   try {
     const idRaw = String(order_id || "").trim();
     const orderQuery = resolveOrderIdentifierQuery(idRaw);
@@ -1923,95 +1891,54 @@ const updateOrderStatus = async (req, res) => {
     }
 
     const normalizedNext = String(status || "").trim().toLowerCase();
-    const shiprocketTracking = await fetchShiprocketTrackingSnapshot({
-      awb: order.shiprocket_awb,
-      shipmentId: order.shiprocket_shipment_id,
-      shiprocketOrderId: order.shiprocket_order_id,
-      createdAt: order.createdAt,
-      fallbackStatus: order.status,
-    });
 
-    const allowedStatuses = Array.isArray(shiprocketTracking.statuses)
-      ? shiprocketTracking.statuses.map((entry) => String(entry || "").trim().toLowerCase()).filter(Boolean)
-      : [];
-
-    if (allowedStatuses.length && !allowedStatuses.includes(normalizedNext)) {
+    // Allow any valid status update by admin
+    if (!validStatuses.includes(normalizedNext)) {
       return res.status(400).json({
         status: false,
-        message: "Status must match one of the Shiprocket statuses for this order.",
-        allowedStatuses,
+        message: "Invalid status. Valid statuses: " + validStatuses.join(", "),
       });
     }
 
-    if (status === "confirm") {
-      if (!product_id) {
-        return res
-          .status(400)
-          .json({ message: "product_id is required for status 'confirm'." });
+    // Update order status
+    order.status = normalizedNext;
+    const history = Array.isArray(order.status_history) ? order.status_history : [];
+    history.push({
+      status: normalizedNext,
+      updatedAt: new Date(),
+      updatedBy: "admin",
+      note: "Updated from admin panel",
+    });
+    order.status_history = history;
+
+    if (normalizedNext === "refund") {
+      order.payment_status = "refunded";
+    } else if (normalizedNext === "return" || normalizedNext === "rto") {
+      if (String(order.payment_status || "").toLowerCase() === "paid") {
+        order.payment_status = "refund_pending";
       }
-      const item = order.items.find(
-        (i) => Number(i.product_id) === Number(product_id)
-      );
-      if (!item) {
-        return res
-          .status(404)
-          .json({ message: "Product not found in this order." });
+    } else if (normalizedNext === "cancelled") {
+      if (String(order.payment_status || "").toLowerCase() === "paid") {
+        order.payment_status = "refund_pending";
       }
-      const product = await Products.findOne({
-        product_id: Number(product_id),
-      });
-      if (!product || product.quantity < item.quantity) {
-        return res
-          .status(400)
-          .json({ status: false, message: "Insufficient stock." });
-      }
-      product.quantity = product.quantity - item.quantity;
-      await product.save();
+    } else if (normalizedNext === "confirmed" && order.payment_status !== "paid") {
       order.payment_status = "paid";
     }
 
-    order.status = normalizedNext;
     await order.save();
-
-    return res.status(200).json({ message: "Order status updated successfully" });
-  } catch (error) {
-    console.error("Error updating order:", error);
-    res.status(500).json({ message: "Server error" });
-  }
-};
-
-const getOrderShiprocketLabel = async (req, res) => {
-  try {
-    const orderRef = req.params.orderRef;
-    const query = resolveOrderIdentifierQuery(orderRef);
-    if (!query) {
-      return res.status(400).json({ status: false, message: "Order identifier is required" });
-    }
-
-    const order = await Orders.findOne(query).lean();
-    if (!order) {
-      return res.status(404).json({ status: false, message: "Order not found" });
-    }
-
-    const labelUrl = await getShiprocketLabelUrl({
-      shipmentId: order.shiprocket_shipment_id,
-      shiprocketOrderId: order.shiprocket_order_id,
-    });
 
     return res.status(200).json({
       status: true,
-      label_url: labelUrl,
-      order_id: order.order_id || null,
-      order_code: order.order_code || "",
-      shipment_id: order.shiprocket_shipment_id || null,
-      awb: order.shiprocket_awb || "",
+      message: "Order status updated successfully",
+      order: {
+        order_id: order.order_id,
+        status: order.status,
+        payment_status: order.payment_status,
+      }
     });
   } catch (error) {
-    console.error("getOrderShiprocketLabel error:", error);
-    return res.status(500).json({
-      status: false,
-      message: error?.message || "Could not fetch Shiprocket label",
-    });
+    console.error("Error updating order:", error);
+    res.status(500).json({ message: "Server error" });
   }
 };
 
@@ -2024,7 +1951,14 @@ const login = (req, res) => {
   const checkUserName = process.env.ADMIN_USERNAME;
   const checkPassword = process.env.PASSWORD;
   if (checkUserName === userName && checkPassword === password) {
-    return res.status(200).json({ status: true, msg: "Login successfull" });
+    // Generate a simple token (in production, use JWT)
+    const token = Buffer.from(`${userName}:${Date.now()}`).toString('base64');
+    return res.status(200).json({
+      status: true,
+      msg: "Login successfull",
+      token,
+      username: userName
+    });
   } else {
     return res.status(401).json({ status: false, msg: "Can't login" });
   }
@@ -2039,14 +1973,20 @@ const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 
 const calculateOrderAmount = (order) => {
   const explicit = Number(order?.amount || 0);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const itemsTotal = Array.isArray(order?.items)
+    ? order.items.reduce((sum, item) => {
+      const price = Number(item?.price || 0);
+      const quantity = Number(item?.quantity || 0);
+      return sum + (Number.isFinite(price) ? price : 0) * (Number.isFinite(quantity) ? quantity : 0);
+    }, 0)
+    : 0;
+  if (Number.isFinite(explicit) && explicit > 0) {
+    if (itemsTotal > 0 && explicit > itemsTotal * 5) return explicit / 100;
+    if (itemsTotal <= 0 && explicit >= 100) return explicit / 100;
+    return explicit;
+  }
 
-  const items = Array.isArray(order?.items) ? order.items : [];
-  return items.reduce((sum, item) => {
-    const price = Number(item?.price || 0);
-    const quantity = Number(item?.quantity || 0);
-    return sum + (Number.isFinite(price) ? price : 0) * (Number.isFinite(quantity) ? quantity : 0);
-  }, 0);
+  return itemsTotal;
 };
 
 const normalizeOrderAmountForAnalytics = (order) => {
@@ -2532,6 +2472,11 @@ const updateSiteSettings = async (req, res) => {
         ? payload.companyEmail
         : (existing?.companyEmail ?? defaults.companyEmail ?? "")
     ).trim();
+    const companyPhone = String(
+      hasPayloadKey("companyPhone")
+        ? payload.companyPhone
+        : (existing?.companyPhone ?? defaults.companyPhone ?? "")
+    ).trim();
 
     const emailFooterDescription = String(
       hasPayloadKey("emailFooterDescription")
@@ -2566,6 +2511,11 @@ const updateSiteSettings = async (req, res) => {
       "Twitter",
       SOCIAL_HOST_WHITELIST.twitter
     );
+    const youtubeUrl = sanitizeSocialUrl(
+      payload.youtubeUrl ?? existing?.youtubeUrl ?? payload.twitterUrl ?? existing?.twitterUrl ?? "",
+      "YouTube",
+      SOCIAL_HOST_WHITELIST.youtube
+    );
     const facebookUrl = sanitizeSocialUrl(
       payload.facebookUrl ?? existing?.facebookUrl ?? "",
       "Facebook",
@@ -2582,12 +2532,14 @@ const updateSiteSettings = async (req, res) => {
           footerDescription,
           companyAddress,
           companyEmail,
+          companyPhone,
           emailFooterDescription,
           logoUrl,
           currencySymbol,
           instagramUrl,
           instagramHandle,
           twitterUrl,
+          youtubeUrl,
           facebookUrl,
           updatedBy: String(payload.updatedBy || "admin"),
         },
@@ -2713,9 +2665,7 @@ const createInstagramGalleryItem = async (req, res) => {
     settings.updatedBy = String(req.body?.updatedBy || "admin");
     await settings.save();
 
-    notifySubscribersInstagramPost(item).catch((err) => {
-      console.error("notifySubscribersInstagramPost error:", err?.message || err);
-    });
+    safeFireAndForget(() => notifySubscribersInstagramPost(item), "notifySubscribersInstagramPost");
 
     return res.status(201).json({ status: true, settings: shapeSiteSettings(settings.toObject()) });
   } catch (error) {
@@ -2852,7 +2802,7 @@ const updateCustomerStatus = async (req, res) => {
           blockedAt: shouldBlock ? new Date() : null,
         },
       },
-      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     ).lean();
 
     if (shouldBlock) {
@@ -3212,9 +3162,9 @@ const topProducts = async (_req, res) => {
 };
 
 // ---------- Banner carousel ----------
-const validateBannerPayload = ({ imageUrl, targetUrl, width, height }) => {
-  if (!imageUrl || !targetUrl) {
-    return "Image and target URL are required.";
+const validateBannerPayload = ({ imageUrl, targetUrl, title, subtitle, width, height }) => {
+  if (!imageUrl || !targetUrl || !title || !subtitle) {
+    return "Title, subtitle, image and target URL are required.";
   }
   const w = Number(width || 0);
   const h = Number(height || 0);
@@ -3226,7 +3176,7 @@ const validateBannerPayload = ({ imageUrl, targetUrl, width, height }) => {
 
 const createBanner = async (req, res) => {
   try {
-    const { imageUrl, targetUrl, title, width, height, order = 0, isActive = true } = req.body;
+    const { imageUrl, targetUrl, title, subtitle, width, height, order = 0, isActive = true } = req.body;
 
     let resolvedImageUrl = imageUrl?.trim();
     let imagePublicId = "";
@@ -3244,6 +3194,8 @@ const createBanner = async (req, res) => {
     const validationError = validateBannerPayload({
       imageUrl: resolvedImageUrl,
       targetUrl,
+      title,
+      subtitle,
       width,
       height,
     });
@@ -3253,6 +3205,7 @@ const createBanner = async (req, res) => {
 
     const banner = await Banner.create({
       title: title?.trim(),
+      subtitle: subtitle?.trim(),
       imageUrl: resolvedImageUrl.trim(),
       imagePublicId,
       targetUrl: targetUrl.trim(),
@@ -3317,6 +3270,7 @@ const updateBanner = async (req, res) => {
 
     const merged = {
       title: payload.title !== undefined ? payload.title : existing.title,
+      subtitle: payload.subtitle !== undefined ? payload.subtitle : existing.subtitle,
       imageUrl: newImageUrl,
       imagePublicId: newPublicId,
       targetUrl: payload.targetUrl ? payload.targetUrl.trim() : existing.targetUrl,
@@ -3356,6 +3310,233 @@ const deleteBanner = async (req, res) => {
   }
 };
 
+const shapeTestimonial = (doc) => ({
+  id: String(doc._id),
+  quote: String(doc.quote || ""),
+  name: String(doc.name || ""),
+  role: String(doc.role || ""),
+  order: Number(doc.order || 0),
+  isActive: doc.isActive !== false,
+  createdAt: doc.createdAt || null,
+  updatedAt: doc.updatedAt || null,
+});
+
+const getTestimonialsAdmin = async (_req, res) => {
+  try {
+    const rows = await Testimonial.find().sort({ order: 1, createdAt: -1 }).lean();
+    const testimonials = rows.map((row) => shapeTestimonial(row));
+    res.status(200).json({ status: true, testimonials });
+  } catch (error) {
+    console.error("getTestimonialsAdmin error:", error);
+    res.status(500).json({ status: false, message: "Server error", error: error.message });
+  }
+};
+
+const getTestimonialsPublic = async (_req, res) => {
+  try {
+    const rows = await Testimonial.find({ isActive: true })
+      .sort({ order: 1, createdAt: -1 })
+      .limit(50)
+      .lean();
+    const testimonials = rows.map((row) => shapeTestimonial(row));
+    res.status(200).json({ status: true, testimonials });
+  } catch (error) {
+    console.error("getTestimonialsPublic error:", error);
+    res.status(500).json({ status: false, message: "Server error", error: error.message });
+  }
+};
+
+const createTestimonial = async (req, res) => {
+  try {
+    const { quote, name, role = "", order = 0, isActive = true } = req.body || {};
+    const q = String(quote || "").trim();
+    const n = String(name || "").trim();
+    if (!q || !n) {
+      return res.status(400).json({ status: false, message: "Quote and name are required." });
+    }
+    const created = await Testimonial.create({
+      quote: q,
+      name: n,
+      role: String(role || "").trim(),
+      order: Number(order) || 0,
+      isActive: isActive !== false,
+    });
+    res.status(201).json({ status: true, testimonial: shapeTestimonial(created) });
+  } catch (error) {
+    console.error("createTestimonial error:", error);
+    res.status(500).json({ status: false, message: "Server error", error: error.message });
+  }
+};
+
+const updateTestimonial = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const payload = req.body || {};
+    const existing = await Testimonial.findById(id);
+    if (!existing) return res.status(404).json({ status: false, message: "Testimonial not found" });
+
+    if (payload.quote !== undefined) existing.quote = String(payload.quote || "").trim();
+    if (payload.name !== undefined) existing.name = String(payload.name || "").trim();
+    if (payload.role !== undefined) existing.role = String(payload.role || "").trim();
+    if (payload.order !== undefined) existing.order = Number(payload.order) || 0;
+    if (payload.isActive !== undefined) existing.isActive = Boolean(payload.isActive);
+
+    if (!existing.quote || !existing.name) {
+      return res.status(400).json({ status: false, message: "Quote and name are required." });
+    }
+    await existing.save();
+    res.status(200).json({ status: true, testimonial: shapeTestimonial(existing) });
+  } catch (error) {
+    console.error("updateTestimonial error:", error);
+    res.status(500).json({ status: false, message: "Server error", error: error.message });
+  }
+};
+
+const deleteTestimonial = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await Testimonial.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ status: false, message: "Testimonial not found" });
+    res.status(200).json({ status: true, message: "Testimonial deleted" });
+  } catch (error) {
+    console.error("deleteTestimonial error:", error);
+    res.status(500).json({ status: false, message: "Server error", error: error.message });
+  }
+};
+
+const getNewsletterSubscribers = async (_req, res) => {
+  try {
+    const subscribers = await NewsletterSubscriber.find({})
+      .sort({ subscribedAt: -1, createdAt: -1 })
+      .lean();
+    const active = subscribers.filter((item) => item.isActive !== false).length;
+    return res.status(200).json({
+      status: true,
+      stats: { total: subscribers.length, active },
+      subscribers: subscribers.map((item) => ({
+        id: String(item._id),
+        email: String(item.email || ""),
+        source: String(item.source || "website"),
+        isActive: item.isActive !== false,
+        subscribedAt: item.subscribedAt || item.createdAt || null,
+        lastNotifiedAt: item.lastNotifiedAt || null,
+        lastNotifiedType: String(item.lastNotifiedType || ""),
+      })),
+    });
+  } catch (error) {
+    console.error("getNewsletterSubscribers error:", error);
+    return res.status(500).json({ status: false, message: "Server error" });
+  }
+};
+
+const getContactSubmissions = async (req, res) => {
+  try {
+    const status = String(req.query?.status || "").trim().toLowerCase();
+    const filter = status === "open" || status === "solved" ? { status } : {};
+    const contacts = await ContactSubmission.find(filter).sort({ createdAt: -1 }).lean();
+    const open = contacts.filter((item) => String(item.status || "open") === "open").length;
+    const solved = contacts.length - open;
+    return res.status(200).json({
+      status: true,
+      stats: { total: contacts.length, open, solved },
+      contacts: contacts.map((item) => ({
+        id: String(item._id),
+        ticketCode: String(item.ticketCode || ""),
+        name: String(item.name || ""),
+        email: String(item.email || ""),
+        department: String(item.department || "GENERAL INQUIRY"),
+        message: String(item.message || ""),
+        status: String(item.status || "open") === "solved" ? "solved" : "open",
+        solvedAt: item.solvedAt || null,
+        solvedBy: String(item.solvedBy || ""),
+        resolutionMessage: String(item.resolutionMessage || ""),
+        createdAt: item.createdAt || null,
+        updatedAt: item.updatedAt || null,
+      })),
+    });
+  } catch (error) {
+    console.error("getContactSubmissions error:", error);
+    return res.status(500).json({ status: false, message: "Server error" });
+  }
+};
+
+const markContactSolved = async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id || !/^[a-f\d]{24}$/i.test(id)) {
+      return res.status(400).json({ status: false, message: "Valid contact id required" });
+    }
+    const solvedBy = String(req.body?.solvedBy || "admin").trim() || "admin";
+    const resolutionMessage = String(req.body?.resolutionMessage || "").trim();
+
+    const contact = await ContactSubmission.findByIdAndUpdate(
+      id,
+      {
+        $set: {
+          status: "solved",
+          solvedAt: new Date(),
+          solvedBy,
+          resolutionMessage,
+        },
+      },
+      { new: true }
+    ).lean();
+
+    if (!contact) {
+      return res.status(404).json({ status: false, message: "Contact not found" });
+    }
+
+    const brevoApiKey = process.env.BREVO_API_KEY;
+    const brevoFromEmail = process.env.BREVO_FROM_EMAIL;
+    const brevoFromName = process.env.BREVO_FROM_NAME || "Amila Gold";
+    if (brevoApiKey && brevoFromEmail && contact.email) {
+      try {
+        const subject = `Your query ${contact.ticketCode} has been resolved`;
+        const textContent = `Hello ${contact.name || "Customer"}, your query (${contact.ticketCode}) has been marked solved.\n\nYour query:\n${String(contact.message || "")}\n\n${resolutionMessage ? `Resolution:\n${resolutionMessage}\n\n` : ""}Thank you for contacting us.`;
+        const htmlContent = `
+          <div style="font-family:Arial,sans-serif;line-height:1.6">
+            <h2 style="color:#1f4d1d">Query Resolved</h2>
+            <p>Hello ${contact.name || "Customer"},</p>
+            <p>Your query <strong>${contact.ticketCode}</strong> has been marked as solved by our support team.</p>
+            <p><strong>Your query:</strong></p>
+            <div style="padding:12px;border:1px solid #ddd;background:#fafafa;border-radius:8px;white-space:pre-wrap;">${String(contact.message || "")}</div>
+            ${resolutionMessage ? `<p><strong>Resolution:</strong> ${resolutionMessage}</p>` : ""}
+            <p>Thank you for contacting us.</p>
+          </div>
+        `;
+        await sendBrevoEmail({
+          apiKey: brevoApiKey,
+          fromEmail: brevoFromEmail,
+          fromName: brevoFromName,
+          toEmail: String(contact.email),
+          toName: String(contact.name || ""),
+          subject,
+          textContent,
+          htmlContent,
+        });
+      } catch (mailErr) {
+        console.error("markContactSolved mail error:", mailErr);
+      }
+    }
+
+    return res.status(200).json({
+      status: true,
+      message: "Contact marked as solved",
+      contact: {
+        id: String(contact._id),
+        status: contact.status,
+        solvedAt: contact.solvedAt || null,
+      },
+    });
+  } catch (error) {
+    console.error("markContactSolved error:", error);
+    return res.status(500).json({ status: false, message: "Server error" });
+  }
+};
+
+// Alias for backwards compatibility - defined after createCategory is defined
+const addCatagory = createCategory;
+
 export {
   getProducts,
   updateProduct,
@@ -3367,7 +3548,6 @@ export {
   deleteDraft,
   login,
   getOrders,
-  getOrderShiprocketLabel,
   updateOrderStatus,
   deleteProduct,
   renameCategory,
@@ -3394,4 +3574,13 @@ export {
   getBannersPublic,
   updateBanner,
   deleteBanner,
+  getTestimonialsAdmin,
+  getTestimonialsPublic,
+  createTestimonial,
+  updateTestimonial,
+  deleteTestimonial,
+  getNewsletterSubscribers,
+  getContactSubmissions,
+  markContactSolved,
+  addCatagory,
 };

@@ -14,7 +14,7 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Credentials", "true");
   res.header(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization, x-admin-token"
   );
   res.header(
     "Access-Control-Allow-Methods",
@@ -42,8 +42,8 @@ const startServer = async () => {
 
   try {
     const { default: adminRouter } = await import("./router/admin.router.js");
-    app.use("/admin", adminRouter);
-    console.log("Admin routes loaded at /admin");
+    app.use("/api/backend", adminRouter);
+    console.log("Admin routes loaded at /api/backend");
   } catch (error) {
     console.warn("Admin routes not loaded:", error.message);
   }
