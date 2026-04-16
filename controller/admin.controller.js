@@ -1,4 +1,5 @@
 import { Catagories } from "../model/catagory.model.js";
+import mongoose from "mongoose";
 import Products from "../model/product.model.js";
 import DraftProducts from "../model/draftProduct.model.js";
 import Orders from "../model/orders.model.js";
@@ -62,6 +63,7 @@ const safeFireAndForget = (fn, label) => {
 };
 
 const normalizeVariantField = (value) => String(value || "").trim().toLowerCase();
+const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(String(value || "").trim());
 
 const buildVariantStockMap = (product) => {
   const map = new Map();
@@ -288,7 +290,7 @@ const buildCategoryTree = (categories) => {
 
   const roots = [];
   map.forEach((cat) => {
-    const parentFromField = cat.parent ? String(cat.parent) : null;
+    const parentFromField = cat.parent ? String(cat.parent) : (cat.parentId ? String(cat.parentId) : null);
     const parentFromAncestors = Array.isArray(cat.ancestors) && cat.ancestors.length
       ? String(cat.ancestors[cat.ancestors.length - 1]?._id || "")
       : null;
@@ -324,7 +326,7 @@ const createCategory = async (req, res) => {
         const parentRef = parentDoc ? parentDoc._id : null;
         let existing = await Catagories.findOne({
           name: trimmed,
-          parent: parentRef,
+          $or: [{ parent: parentRef }, { parentId: parentRef }],
         });
         if (!existing) {
           const ancestors = parentDoc
@@ -336,6 +338,7 @@ const createCategory = async (req, res) => {
           existing = await Catagories.create({
             name: trimmed,
             parent: parentRef,
+            parentId: parentRef,
             ancestors,
           });
         }
@@ -368,9 +371,11 @@ const createCategory = async (req, res) => {
       ];
     }
 
+    const parentRef = parentDoc ? parentDoc._id : null;
     const result = await Catagories.create({
       name: trimmed,
-      parent: parentDoc ? parentDoc._id : null,
+      parent: parentRef,
+      parentId: parentRef,
       ancestors,
     });
     res.status(201).json({ status: true, category: result });
@@ -465,6 +470,20 @@ const applyWeightVariantsToDoc = (doc, wvs) => {
   if (wvs.length > 0 && !doc.price) {
     doc.price = wvs[0].price;
     doc.selling_price = wvs[0].selling_price || wvs[0].price;
+  }
+};
+
+const syncProductImagesFromVariants = (doc, variants = []) => {
+  const variantImages = variants
+    .map((variant) => String(variant?.image || "").trim())
+    .filter(Boolean);
+  const variantImagePublicIds = variants
+    .map((variant) => String(variant?.imagePublicId || "").trim())
+    .filter(Boolean);
+
+  if (variantImages.length) {
+    doc.product_image = variantImages;
+    doc.image_public_ids = variantImagePublicIds;
   }
 };
 
@@ -690,6 +709,7 @@ const uploadProduct = async (req, res) => {
     // Apply variants to set quantity and price if not set
     if (weightVariants.length) {
       applyWeightVariantsToDoc(newProduct, weightVariants);
+      syncProductImagesFromVariants(newProduct, weightVariants);
     }
 
     await newProduct.save();
@@ -861,6 +881,11 @@ const updateProduct = async (req, res) => {
     const imageFiles = files.images || files.image || files.files || [];
     const videoFile = files.video ? files.video[0] : null;
     const variantImageFiles = files.variantImages || [];
+    const variantImageIndexes = parseArrayField(
+      req.body.variantImageIndexes || req.body.variant_image_indexes
+    )
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value >= 0);
     const removedImageUrls = parseArrayField(req.body.removedImageUrls || req.body.removed_image_urls);
     const removeVideoFlag = req.body.removeVideo === "true";
     const {
@@ -926,7 +951,7 @@ const updateProduct = async (req, res) => {
         .json({ status: false, message: "selling_price must be a valid number" });
     }
 
-    const product = await Products.findOne({ product_id: Number(product_id) });
+    let product = await Products.findOne({ product_id: Number(product_id) });
     if (!product) {
       return res
         .status(404)
@@ -935,22 +960,40 @@ const updateProduct = async (req, res) => {
     const previousQuantity = Number(product.quantity || 0);
     const previousVariantStockMap = buildVariantStockMap(product.toObject());
 
-    const providedCategoryId = categoryId || req.body.catagory_id;
+    const providedCategoryId = String(categoryId || req.body.catagory_id || "").trim();
     let categoryData = null;
     if (providedCategoryId) {
-      categoryData = await Catagories.findById(providedCategoryId);
+      if (isValidObjectId(providedCategoryId)) {
+        categoryData = await Catagories.findById(providedCategoryId);
+      } else {
+        categoryData = await Catagories.findOne({ name: providedCategoryId });
+      }
     }
     if (!categoryData && catagory) {
-      categoryData = await Catagories.findOne({ name: catagory.trim() });
+      categoryData = await Catagories.findOne({ name: String(catagory).trim() });
     }
     // allow status-only updates by falling back to existing category
     if (!categoryData) {
-      categoryData = await Catagories.findById(product.catagory_id);
+      const existingCategoryRef = String(product.catagory_id || "").trim();
+      if (isValidObjectId(existingCategoryRef)) {
+        categoryData = await Catagories.findById(existingCategoryRef);
+      } else if (existingCategoryRef) {
+        categoryData = await Catagories.findOne({ name: existingCategoryRef });
+      }
     }
     // If still no category, skip category update (allow partial updates)
     if (!categoryData) {
       console.warn('No valid category found, skipping category update for product:', product_id);
     }
+
+    console.log("Update product files meta:", {
+      imageFiles: imageFiles.length,
+      variantImageFiles: variantImageFiles.length,
+      variantImageIndexes,
+      removedImageUrls,
+      providedCategoryId,
+      resolvedCategoryId: categoryData?._id ? String(categoryData._id) : "",
+    });
 
     let specsArr = product.specifications || [];
     let highlightsArr = product.key_highlights || [];
@@ -981,6 +1024,75 @@ const updateProduct = async (req, res) => {
       if (wvError) {
         return res.status(400).json({ status: false, message: wvError });
       }
+
+      const existingVariants = Array.isArray(product.variants) ? product.variants : [];
+      const existingVariantByLabel = new Map();
+      existingVariants.forEach((variant) => {
+        existingVariantByLabel.set(normalizeVariantField(variant?.label), variant);
+      });
+
+      // Map uploaded files to concrete variant indexes.
+      // Preferred: explicit indexes from frontend (variantImageIndexes).
+      // Fallback: sequential mapping for older clients.
+      const uploadIndexByVariantIndex = new Map();
+      if (variantImageFiles.length > 0) {
+        if (variantImageIndexes.length === variantImageFiles.length) {
+          variantImageIndexes.forEach((variantIdx, fileIdx) => {
+            if (variantIdx < weightVariants.length) {
+              uploadIndexByVariantIndex.set(variantIdx, fileIdx);
+            }
+          });
+        } else {
+          for (let i = 0; i < Math.min(variantImageFiles.length, weightVariants.length); i += 1) {
+            uploadIndexByVariantIndex.set(i, i);
+          }
+        }
+      }
+
+      // Preserve existing image if payload didn't explicitly remove/replace it.
+      weightVariants.forEach((variant, variantIdx) => {
+        const key = normalizeVariantField(variant?.label);
+        const existing = existingVariantByLabel.get(key);
+        const hasReplacementUpload = uploadIndexByVariantIndex.has(variantIdx);
+        const payloadImage = String(variant?.image || "").trim();
+
+        if (!payloadImage && !hasReplacementUpload && existing?.image) {
+          variant.image = existing.image;
+        }
+        if (!variant?.imagePublicId && existing?.imagePublicId && variant?.image === existing?.image) {
+          variant.imagePublicId = existing.imagePublicId;
+        }
+      });
+
+      for (const [variantIdx, fileIdx] of uploadIndexByVariantIndex.entries()) {
+        const file = variantImageFiles[fileIdx];
+        if (!file || !weightVariants[variantIdx]) continue;
+        const uploadRes = await uploadToCloudinary(
+          file.buffer,
+          `variant-${product.product_id}-${Date.now()}-${file.originalname}`,
+          file.mimetype
+        );
+        weightVariants[variantIdx].image = uploadRes.secure_url;
+        weightVariants[variantIdx].imagePublicId = uploadRes.public_id;
+      }
+
+      // Delete old Cloudinary assets that were removed/replaced.
+      const nextVariantByLabel = new Map();
+      weightVariants.forEach((variant) => {
+        nextVariantByLabel.set(normalizeVariantField(variant?.label), variant);
+      });
+      existingVariants.forEach((existing) => {
+        const existingPublicId = String(existing?.imagePublicId || "").trim();
+        if (!existingPublicId) return;
+        const next = nextVariantByLabel.get(normalizeVariantField(existing?.label));
+        const nextImage = String(next?.image || "").trim();
+        const existingImage = String(existing?.image || "").trim();
+        if (!nextImage || nextImage !== existingImage) {
+          deleteFromCloudinary(existingPublicId).catch((err) =>
+            console.warn("Failed to delete removed variant image:", existingPublicId, err?.message)
+          );
+        }
+      });
     }
 
     // compute current images after removal but before adding new files
@@ -1151,21 +1263,27 @@ const updateProduct = async (req, res) => {
       videoPublicId = "";
     }
 
-    product.title = (title ?? name) || product.title;
-    product.name = name ?? product.name;
-    if (hasPrice) product.price = parsedPrice;
-    if (hasSellingPrice) product.selling_price = parsedSellingPrice;
-    if (quantity !== undefined) product.quantity = Number(quantity);
-    if (hasSku) product.sku = parsedSku;
-    product.description = description ?? product.description;
-    product.selling_price_link = selling_price_link ?? product.selling_price_link;
-    product.catagory_id = categoryData._id;
-    product.product_image = imageUrls;
-    product.image_public_ids = publicIds;
-    product.specifications = specsArr;
-    product.key_highlights = highlightsArr;
-    product.video_url = videoUrl;
-    product.video_public_id = videoPublicId;
+    const applyProductMutations = (targetDoc) => {
+      targetDoc.title = (title ?? name) || targetDoc.title;
+      targetDoc.name = name ?? targetDoc.name;
+      if (hasPrice) targetDoc.price = parsedPrice;
+      if (hasSellingPrice) targetDoc.selling_price = parsedSellingPrice;
+      if (quantity !== undefined) targetDoc.quantity = Number(quantity);
+      if (hasSku) targetDoc.sku = parsedSku;
+      targetDoc.description = description ?? targetDoc.description;
+      targetDoc.selling_price_link = selling_price_link ?? targetDoc.selling_price_link;
+      if (categoryData?._id) {
+        targetDoc.catagory_id = categoryData._id;
+      }
+      targetDoc.product_image = imageUrls;
+      targetDoc.image_public_ids = publicIds;
+      targetDoc.specifications = specsArr;
+      targetDoc.key_highlights = highlightsArr;
+      targetDoc.video_url = videoUrl;
+      targetDoc.video_public_id = videoPublicId;
+    };
+
+    applyProductMutations(product);
     function safeParseArray(val) {
       if (Array.isArray(val)) return val;
       if (typeof val === "string") {
@@ -1182,11 +1300,50 @@ const updateProduct = async (req, res) => {
     // Apply weight variants if provided
     if (weightVariants.length) {
       applyWeightVariantsToDoc(product, weightVariants);
+      // Keep list/thumb image in sync with variant images for variant-only products.
+      if (imageFiles.length === 0 && removedImageUrls.length === 0 && req.body.removeImages !== "true") {
+        syncProductImagesFromVariants(product, weightVariants);
+      } else if (!product.product_image?.length) {
+        syncProductImagesFromVariants(product, weightVariants);
+      }
     }
     if (status) product.status = status;
     if (draft_stage) product.draft_stage = draft_stage;
 
-    await product.save();
+    const persistWithRetry = async () => {
+      try {
+        await product.save();
+      } catch (saveError) {
+        if (saveError?.name !== "VersionError") throw saveError;
+
+        console.warn("updateProduct version conflict, retrying once", {
+          product_id: Number(product_id),
+          message: saveError?.message,
+        });
+
+        const latest = await Products.findOne({ product_id: Number(product_id) });
+        if (!latest) throw saveError;
+
+        product = latest;
+        applyProductMutations(product);
+        if (ingredients !== undefined) product.ingredients = safeParseArray(ingredients);
+        if (nutritions !== undefined) product.nutritions = safeParseArray(nutritions);
+        if (weightVariants.length) {
+          applyWeightVariantsToDoc(product, weightVariants);
+          if (imageFiles.length === 0 && removedImageUrls.length === 0 && req.body.removeImages !== "true") {
+            syncProductImagesFromVariants(product, weightVariants);
+          } else if (!product.product_image?.length) {
+            syncProductImagesFromVariants(product, weightVariants);
+          }
+        }
+        if (status) product.status = status;
+        if (draft_stage) product.draft_stage = draft_stage;
+
+        await product.save();
+      }
+    };
+
+    await persistWithRetry();
 
     const currentQuantity = Number(product.quantity || 0);
     if (previousQuantity <= 0 && currentQuantity > 0) {
@@ -1754,7 +1911,7 @@ const renameCategory = async (req, res) => {
 
     const sibling = await Catagories.findOne({
       _id: { $ne: id },
-      parent: cat.parent,
+      $or: [{ parent: cat.parent || cat.parentId || null }, { parentId: cat.parent || cat.parentId || null }],
       name: trimmed,
     });
     if (sibling) {
@@ -1764,14 +1921,27 @@ const renameCategory = async (req, res) => {
     }
 
     cat.name = trimmed;
+    if (cat.parent && !cat.parentId) cat.parentId = cat.parent;
+    if (cat.parentId && !cat.parent) cat.parent = cat.parentId;
     await cat.save();
 
-    // keep descendant ancestor names in sync
-    await Catagories.updateMany(
-      { "ancestors._id": cat._id },
-      { $set: { "ancestors.$[elem].name": trimmed } },
-      { arrayFilters: [{ "elem._id": cat._id }] }
-    );
+    // Keep descendant ancestor names in sync without relying on arrayFilters casting.
+    const descendants = await Catagories.find({ "ancestors._id": cat._id });
+    for (const descendant of descendants) {
+      if (!Array.isArray(descendant.ancestors)) continue;
+      let changed = false;
+      descendant.ancestors = descendant.ancestors.map((entry) => {
+        if (String(entry?._id) === String(cat._id) && entry.name !== trimmed) {
+          changed = true;
+          const raw = entry && typeof entry.toObject === "function" ? entry.toObject() : entry;
+          return { ...(raw || {}), _id: entry._id, name: trimmed };
+        }
+        return entry;
+      });
+      if (changed) {
+        await descendant.save();
+      }
+    }
 
     return res.status(200).json({ status: true, category: cat });
   } catch (error) {

@@ -522,13 +522,13 @@ export const updateUserProfile = async (req, res) => {
       return res.status(customerAccess.code).json({ status: false, message: customerAccess.message });
     }
 
-    const update = { email: customerAccess.email, name, phone };
+    const update = { email: auth.email, name, phone };
     if (typeof gender === "string" && ["male", "female", "others"].includes(gender)) {
       update.gender = gender;
     }
 
     const profile = await Profile.findOneAndUpdate(
-      { email: customerAccess.email },
+      { email: auth.email },
       update,
       { new: true, upsert: true, setDefaultsOnInsert: true }
     ).lean();
@@ -872,24 +872,12 @@ export const createOrder = async (req, res) => {
     const orderItems = [];
     for (const it of items) {
       const prod = productMap.get(Number(it.product_id));
-      if (!prod) {
-        return res.status(400).json({ status: false, message: `Product not found for item ${String(it?.product_id || "")}` });
-      }
       const itemSize = String(it.size || "").trim().toLowerCase();
       const itemColor = String(it.color || "").trim();
       const requestedPrice = Number(it.price || 0);
       let price = Number.isFinite(requestedPrice) && requestedPrice > 0 ? requestedPrice : 0;
-      let availableStock = Number(prod.quantity || 0);
-      if (Array.isArray(prod.variants) && prod.variants.length > 0) {
-        const matchedVariant = itemSize
-          ? prod.variants.find((v) => String(v?.label || "").trim().toLowerCase() === itemSize)
-          : null;
-        if (itemSize && !matchedVariant) {
-          return res.status(400).json({ status: false, message: `Variant '${String(it.size || "")}' is not available for ${String(prod?.title || prod?.name || "this product")}` });
-        }
-        availableStock = matchedVariant
-          ? Number(matchedVariant.stock || 0)
-          : prod.variants.reduce((sum, variant) => sum + Math.max(0, Number(variant?.stock || 0)), 0);
+      if (prod && Array.isArray(prod.variants) && prod.variants.length > 0 && itemSize) {
+        const matchedVariant = prod.variants.find((v) => String(v?.label || "").trim().toLowerCase() === itemSize);
         if (matchedVariant && !price) {
           price = Number(matchedVariant.price || matchedVariant.selling_price || 0);
         }
@@ -898,15 +886,6 @@ export const createOrder = async (req, res) => {
         price = prod ? Number(prod.selling_price || prod.price || 0) : 0;
       }
       const qty = Number(it.quantity) || 1;
-      if (qty > Math.max(0, availableStock)) {
-        return res.status(409).json({
-          status: false,
-          message: `${String(prod?.title || prod?.name || "Product")} is out of stock for requested quantity`,
-          product_id: Number(it.product_id) || 0,
-          requested_qty: qty,
-          available_qty: Math.max(0, availableStock),
-        });
-      }
       const variantImage = Array.isArray(prod?.variants) && prod.variants.length
         ? String(prod.variants[0]?.image || "")
         : "";
@@ -1007,36 +986,15 @@ export const confirmPayment = async (req, res) => {
 
       for (const it of items) {
         const prod = productMap.get(Number(it.product_id));
-        if (!prod) {
-          return res.status(400).json({ status: false, message: `Product not found for item ${String(it?.product_id || "")}` });
-        }
         const itemSize = String(it.size || "").trim().toLowerCase();
         const requestedPrice = Number(it.price || 0);
         let price = Number.isFinite(requestedPrice) && requestedPrice > 0 ? requestedPrice : 0;
-        let availableStock = Number(prod.quantity || 0);
-        if (Array.isArray(prod.variants) && prod.variants.length > 0) {
-          const matchedVariant = itemSize
-            ? prod.variants.find((v) => String(v?.label || "").trim().toLowerCase() === itemSize)
-            : null;
-          if (itemSize && !matchedVariant) {
-            return res.status(400).json({ status: false, message: `Variant '${String(it.size || "")}' is not available for ${String(prod?.title || prod?.name || "this product")}` });
-          }
-          availableStock = matchedVariant
-            ? Number(matchedVariant.stock || 0)
-            : prod.variants.reduce((sum, variant) => sum + Math.max(0, Number(variant?.stock || 0)), 0);
+        if (prod && Array.isArray(prod.variants) && prod.variants.length > 0 && itemSize) {
+          const matchedVariant = prod.variants.find((v) => String(v?.label || "").trim().toLowerCase() === itemSize);
           if (matchedVariant && !price) price = Number(matchedVariant.price || matchedVariant.selling_price || 0);
         }
         if (!price) price = prod ? Number(prod.selling_price || prod.price || 0) : 0;
         const qty = Number(it.quantity) || 1;
-        if (qty > Math.max(0, availableStock)) {
-          return res.status(409).json({
-            status: false,
-            message: `${String(prod?.title || prod?.name || "Product")} is out of stock for requested quantity`,
-            product_id: Number(it.product_id) || 0,
-            requested_qty: qty,
-            available_qty: Math.max(0, availableStock),
-          });
-        }
         const variantImage = Array.isArray(prod?.variants) && prod.variants.length
           ? String(prod.variants[0]?.image || "")
           : "";

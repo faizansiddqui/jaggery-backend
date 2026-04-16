@@ -9,6 +9,8 @@ import {
   login,
   deleteProduct,
   getCategories,
+  renameCategory,
+  deleteCategory,
   getPublicSiteSettings,
   getCustomersOverview,
   getSiteSettings,
@@ -76,6 +78,10 @@ router.patch('/admin/communications/contacts/:id/solve', markContactSolved);
 
 
 router.post('/admin/add-catagory', addCatagory);
+router.patch('/admin/update-catagory/:id', renameCategory);
+router.patch('/admin/update-category/:id', renameCategory);
+router.delete('/admin/delete-catagory/:id', deleteCategory);
+router.delete('/admin/delete-category/:id', deleteCategory);
 router.post('/admin/login', login)
 
 // Product routes with file upload support
