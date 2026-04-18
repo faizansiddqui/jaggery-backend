@@ -18,10 +18,9 @@ const CatagorySchema = new mongoose.Schema(
 );
 
 // Keep parent references in sync across both fields.
-CatagorySchema.pre("save", function syncParentRefs(next) {
+CatagorySchema.pre("save", function syncParentRefs() {
   if (this.parent && !this.parentId) this.parentId = this.parent;
   if (this.parentId && !this.parent) this.parent = this.parentId;
-  next();
 });
 
 // Create compound indexes for unique name per parent level.
